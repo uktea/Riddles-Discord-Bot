@@ -19,6 +19,7 @@ class RiddleBot(commands.Bot):
     def __init__(self, config: BotConfig, database: RiddleDatabase) -> None:
         intents = discord.Intents.default()
         intents.message_content = False
+        intents.reactions = True
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,

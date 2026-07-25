@@ -4,12 +4,13 @@
 
 ## 1. 事前準備
 
-Python 3.11以上と仮想環境機能をインストールします。
+Python 3.11以上、仮想環境機能、Gitをインストールします。
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-venv
+sudo apt install python3 python3-venv git
 python3 --version
+git --version
 ```
 
 表示されたバージョンが3.11未満の場合は、そのディストリビューションが提供するPython 3.11以上を導入してから進めてください。
@@ -93,8 +94,10 @@ sudo -u discordbot /bin/sh -c \
 
 1. ログにBotのログイン成功が表示される。
 2. 対象サーバーで `/help` と `/status` が実行できる。
-3. `/briddle` または `/riddle` で公開スレッドが作成される。
+3. `/briddle`、`/riddle`、`/ogiri` で公開スレッドが作成される。
 4. スレッド内の「回答する」ボタンから回答できる。
+5. 問題投稿に良問マーク、公開回答に正解採用絵文字、`/ogiri` の回答にMVP絵文字が付き、出題者の採用操作へBotが🏆を付ける。
+6. `/hint` で文章とメディアがスポイラー表示される。
 
 停止する場合は `Ctrl+C` を押します。
 
@@ -170,21 +173,59 @@ sudo journalctl -u riddles-discord-bot -n 100 --no-pager
 sudo systemctl restart riddles-discord-bot
 ```
 
-依存パッケージを更新する場合:
+### Gitから安全に更新する
+
+次の手順は、`/opt/riddles-discord-bot/.git` が存在し、`/opt/riddles-discord-bot` 自体がGitリポジトリのルートになっている環境向けです。最初に確認できます。
+
+```bash
+sudo -u discordbot git -C /opt/riddles-discord-bot rev-parse --show-toplevel
+```
+
+`/opt/riddles-discord-bot` が表示されれば、そのまま更新できます。`fatal: not a git repository` と表示された場合は更新を進めず、`.git` の配置を確認してください。既存の `.env` や `data/` を消したり、運用ディレクトリへ別のリポジトリを重ねてcloneしたりしないでください。
+
+まずBotを停止します。重要な運用データがある場合は、停止後にSQLiteファイルをバックアップします。次のバックアップコマンドは、コピー先がまだ存在しない場合だけ実行してください。
 
 ```bash
 sudo systemctl stop riddles-discord-bot
-sudo -u discordbot /opt/riddles-discord-bot/.venv/bin/python -m pip install -r /opt/riddles-discord-bot/requirements.txt
-sudo systemctl start riddles-discord-bot
+sudo -u discordbot cp --no-clobber -p \
+  /opt/riddles-discord-bot/data/riddles.db \
+  /opt/riddles-discord-bot/data/riddles.db.before-v3
 ```
 
-コードを入れ替える場合も、先にサービスを停止し、所有者が `discordbot:discordbot` のままであることを確認してから再開します。同じBotを手動起動とsystemdの両方から同時に動かさないでください。
+ローカルの状態と取得予定のコミットを確認してから、fast-forwardだけを許可して更新します。
+
+```bash
+sudo -u discordbot git -C /opt/riddles-discord-bot status --short
+sudo -u discordbot git -C /opt/riddles-discord-bot fetch origin
+sudo -u discordbot git -C /opt/riddles-discord-bot log -1 --oneline origin/main
+sudo -u discordbot git -C /opt/riddles-discord-bot pull --ff-only origin main
+```
+
+`status --short` に追跡済みファイルの変更が表示された場合は、`pull` を実行せず変更内容を確認してください。`git reset --hard` で消さないでください。配置先を専用ユーザーのホームにもしている環境では、`.bash_history`、`.bashrc`、`.profile`、`.cache/` などが未追跡ファイルとして表示されることがあります。これらはBotのソースではないため、`git add .` で追加しないでください。
+
+依存パッケージを更新し、サービスを開始します。
+
+```bash
+sudo -u discordbot /opt/riddles-discord-bot/.venv/bin/python -m pip install -r /opt/riddles-discord-bot/requirements.txt
+sudo systemctl start riddles-discord-bot
+sudo systemctl status riddles-discord-bot --no-pager -l
+```
+
+新しいBotの初回起動時に、既存のSQLiteデータベースはスキーマバージョン3へ自動移行されます。既存の問題、正解者、回答回数、サーバー設定、個人設定は保持されるため、`data/riddles.db` を削除したり空のDBへ置き換えたりしないでください。
+
+起動後はログとDiscord上の応答を確認します。
+
+```bash
+sudo journalctl -u riddles-discord-bot -n 100 --no-pager
+```
+
+コードを手作業で入れ替える場合も、先にサービスを停止し、所有者が `discordbot:discordbot` のままであることを確認してから再開します。同じBotを手動起動とsystemdの両方から同時に動かさないでください。
 
 ## 8. 運用するDiscordサーバーを変更する
 
 未終了問題を残したまま切り替えないでください。次の順序で操作します。
 
-1. 旧サーバーで管理者が `/list` を確認し、未終了問題が終わるまで待つか、各問題を `/delete riddle_id` で取り消します。
+1. 旧サーバーで管理者が `/list` を確認し、未終了問題が終わるまで待つか、各問題を `/delete riddle_id` で取り消します。Discord上の問題投稿と回答スレッドも消す場合は、受付中に `/delete riddle_id purge:true` を使用します。
 2. Developer Portalの招待URLを使い、同じBotアカウントを必要な権限付きで新サーバーへ招待します。
 3. 旧サーバーからBotを削除します。
 4. systemdサービスを停止します。
@@ -207,9 +248,9 @@ sudo systemctl status riddles-discord-bot
 ```
 
 7. 新サーバーで `/help` と `/status` を実行します。
-8. 出題チャンネルを制限する場合は、そのチャンネルで管理者が `/pref allowed_channel current` を実行します。
+8. `/status` でサーバー設定を確認します。出題チャンネルを制限する場合は、そのチャンネルで管理者が `/pref allowed_channel current` を実行し、評価絵文字なども必要に応じて `/pref` で設定します。
 
-`/pref` の設定はサーバーごとに保存されるため、新サーバーでは `allowed_channel` を設定し直してください。`.env` の書き換えだけで起動中の接続先をライブ切替することはできません。
+`/pref` の設定はサーバーごとに保存されるため、新サーバーでは出題チャンネル、評価絵文字、その他の設定を確認してください。`.env` の書き換えだけで起動中の接続先をライブ切替することはできません。
 
 ## 9. スリープを防止する
 

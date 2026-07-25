@@ -12,8 +12,11 @@ from threading import Barrier
 from riddle_bot.database import (
     ActiveRiddleLimitError,
     DiscordBindingError,
+    ManualAcceptanceStatus,
     RiddleDatabase,
     SubmissionStatus,
+    UnsupportedSchemaVersionError,
+    emoji_identity_key,
 )
 
 
@@ -38,6 +41,9 @@ class RiddleDatabaseTests(unittest.TestCase):
         deadline_at: datetime | None = None,
         public_answers: bool = False,
         answer_limit: int | None = None,
+        answer_accept_emoji: str = "✅",
+        ogiri_mvp_emoji: str = "👑",
+        good_question_emoji: str = "⭐",
     ):
         return self.database.create_riddle(
             guild_id=guild_id,
@@ -52,6 +58,9 @@ class RiddleDatabaseTests(unittest.TestCase):
             created_at=self.now,
             public_answers=public_answers,
             answer_limit=answer_limit,
+            answer_accept_emoji=answer_accept_emoji,
+            ogiri_mvp_emoji=ogiri_mvp_emoji,
+            good_question_emoji=good_question_emoji,
         )
 
     def test_uses_wal_and_persists_settings_between_instances(self) -> None:
@@ -59,6 +68,9 @@ class RiddleDatabaseTests(unittest.TestCase):
         self.assertIsNone(defaults.allowed_channel_id)
         self.assertEqual(defaults.max_active, 10)
         self.assertTrue(defaults.mention_winners)
+        self.assertEqual(defaults.answer_accept_emoji, "✅")
+        self.assertEqual(defaults.ogiri_mvp_emoji, "👑")
+        self.assertEqual(defaults.good_question_emoji, "⭐")
 
         personal_defaults = self.database.get_user_preferences(1, 100)
         self.assertFalse(personal_defaults.public_answers)
@@ -81,6 +93,76 @@ class RiddleDatabaseTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database_path)) as connection:
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(journal_mode.lower(), "wal")
+
+    def test_guild_evaluation_emojis_are_distinct_and_persistent(self) -> None:
+        updated = self.database.update_guild_settings(
+            1,
+            answer_accept_emoji="☑️",
+            ogiri_mvp_emoji="🏅",
+            good_question_emoji="💯",
+        )
+
+        self.assertEqual(updated.answer_accept_emoji, "☑️")
+        self.assertEqual(updated.ogiri_mvp_emoji, "🏅")
+        self.assertEqual(updated.good_question_emoji, "💯")
+        self.assertEqual(
+            RiddleDatabase(self.database_path).get_guild_settings(1),
+            updated,
+        )
+        with self.assertRaisesRegex(ValueError, "それぞれ別"):
+            self.database.update_guild_settings(
+                1,
+                ogiri_mvp_emoji="☑️",
+            )
+        with self.assertRaisesRegex(ValueError, "それぞれ別"):
+            self.database.update_guild_settings(
+                1,
+                ogiri_mvp_emoji="☑",
+            )
+
+        custom_emoji_id = "123456789012345"
+        self.database.update_guild_settings(
+            1,
+            answer_accept_emoji=f"<:old_name:{custom_emoji_id}>",
+        )
+        with self.assertRaisesRegex(ValueError, "それぞれ別"):
+            self.database.update_guild_settings(
+                1,
+                ogiri_mvp_emoji=f"<a:new_name:{custom_emoji_id}>",
+            )
+        with self.assertRaisesRegex(ValueError, "公式記録マーク"):
+            self.database.update_guild_settings(
+                1,
+                good_question_emoji="🏆",
+            )
+        with self.assertRaisesRegex(ValueError, "公式記録マーク"):
+            self.database.update_guild_settings(
+                1,
+                good_question_emoji="🏆️",
+            )
+
+    def test_emoji_identity_key_matches_discord_reaction_identity(self) -> None:
+        custom_emoji_id = "123456789012345"
+        self.assertEqual(
+            emoji_identity_key(f"<:old_name:{custom_emoji_id}>"),
+            emoji_identity_key(f"<a:new_name:{custom_emoji_id}>"),
+        )
+        self.assertEqual(
+            emoji_identity_key("☑"),
+            emoji_identity_key("☑️"),
+        )
+        self.assertNotEqual(
+            emoji_identity_key("✅"),
+            emoji_identity_key("⭐"),
+        )
+
+    def test_riddle_snapshot_rejects_semantically_duplicate_emojis(self) -> None:
+        custom_emoji_id = "123456789012345"
+        with self.assertRaisesRegex(ValueError, "それぞれ別"):
+            self.create_riddle(
+                answer_accept_emoji=f"<:old_name:{custom_emoji_id}>",
+                ogiri_mvp_emoji=f"<a:new_name:{custom_emoji_id}>",
+            )
 
     def test_user_preferences_are_per_guild_and_persist(self) -> None:
         updated = self.database.update_user_preferences(
@@ -167,14 +249,148 @@ class RiddleDatabaseTests(unittest.TestCase):
         self.assertEqual(riddle.question, "旧問題")
         self.assertFalse(riddle.public_answers)
         self.assertIsNone(riddle.answer_limit)
+        self.assertFalse(riddle.manual_judging)
 
         with closing(sqlite3.connect(legacy_path)) as connection:
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(riddles)")
             }
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertTrue({"public_answers", "answer_limit"} <= columns)
-        self.assertEqual(version, 2)
+        self.assertTrue(
+            {
+                "public_answers",
+                "answer_limit",
+                "manual_judging",
+                "answer_accept_emoji",
+                "ogiri_mvp_emoji",
+                "good_question_emoji",
+            }
+            <= columns
+        )
+        self.assertEqual(version, 3)
+
+    def test_existing_v2_database_is_migrated_idempotently(self) -> None:
+        legacy_path = Path(self.temporary_directory.name) / "legacy-v2.db"
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 2;
+                CREATE TABLE riddles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    thread_id INTEGER,
+                    message_id INTEGER,
+                    creator_id INTEGER NOT NULL,
+                    mode TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer_display TEXT NOT NULL,
+                    answers_json TEXT NOT NULL,
+                    deadline_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    winner_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    public_answers INTEGER NOT NULL DEFAULT 0,
+                    answer_limit INTEGER
+                );
+                CREATE TABLE riddle_winners (
+                    riddle_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    answered_at TEXT NOT NULL,
+                    PRIMARY KEY (riddle_id, user_id)
+                );
+                CREATE TABLE riddle_attempts (
+                    riddle_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    last_answered_at TEXT NOT NULL,
+                    PRIMARY KEY (riddle_id, user_id)
+                );
+                CREATE TABLE user_preferences (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    public_answers INTEGER NOT NULL DEFAULT 0,
+                    answer_limit INTEGER,
+                    PRIMARY KEY (guild_id, user_id)
+                );
+                INSERT INTO riddles (
+                    guild_id, channel_id, thread_id, message_id, creator_id,
+                    mode, question, answer_display, answers_json, deadline_at,
+                    status, winner_id, created_at, public_answers, answer_limit
+                )
+                VALUES (
+                    1, 10, 20, 30, 100, 'riddle', 'V2問題', '答え', '["答え"]',
+                    '2026-07-25T13:00:00.000000Z', 'active', 501,
+                    '2026-07-25T12:00:00.000000Z', 1, 3
+                );
+                INSERT INTO riddle_winners
+                VALUES (1, 501, '2026-07-25T12:10:00.000000Z');
+                INSERT INTO riddle_attempts
+                VALUES (1, 501, 2, '2026-07-25T12:11:00.000000Z');
+                INSERT INTO user_preferences VALUES (1, 100, 1, 3);
+                """
+            )
+
+        migrated = RiddleDatabase(legacy_path)
+        reopened = RiddleDatabase(legacy_path)
+        riddle = reopened.get_riddle(1)
+
+        self.assertEqual(riddle.question, "V2問題")
+        self.assertTrue(riddle.public_answers)
+        self.assertEqual(riddle.answer_limit, 3)
+        self.assertFalse(riddle.manual_judging)
+        self.assertEqual(riddle.answer_accept_emoji, "✅")
+        self.assertEqual(riddle.ogiri_mvp_emoji, "👑")
+        self.assertEqual(riddle.good_question_emoji, "⭐")
+        self.assertEqual(reopened.list_winner_ids(1), (501,))
+        self.assertEqual(reopened.get_answer_attempt_count(1, 501), 2)
+        self.assertTrue(reopened.get_user_preferences(1, 100).public_answers)
+        self.assertEqual(migrated.get_riddle(1), riddle)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            mapping_table = connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name = 'riddle_answer_messages'
+                """
+            ).fetchone()
+        self.assertEqual(version, 3)
+        self.assertIsNotNone(mapping_table)
+
+    def test_future_schema_version_is_rejected_without_downgrade(self) -> None:
+        future_path = Path(self.temporary_directory.name) / "future.db"
+        with closing(sqlite3.connect(future_path)) as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 4;
+                CREATE TABLE future_only (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO future_only VALUES (1, 'preserve-me');
+                """
+            )
+
+        with self.assertRaisesRegex(
+            UnsupportedSchemaVersionError,
+            r"DB: v4 / 対応: v3",
+        ):
+            RiddleDatabase(future_path)
+
+        with closing(sqlite3.connect(future_path)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            preserved = connection.execute(
+                "SELECT value FROM future_only WHERE id = 1"
+            ).fetchone()[0]
+            riddles_table = connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name = 'riddles'
+                """
+            ).fetchone()
+        self.assertEqual(version, 4)
+        self.assertEqual(preserved, "preserve-me")
+        self.assertIsNone(riddles_table)
 
     def test_create_bind_lookup_list_and_limit(self) -> None:
         self.database.update_guild_settings(1, max_active=1)
@@ -223,6 +439,256 @@ class RiddleDatabaseTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.create_riddle(public_answers=1)  # type: ignore[arg-type]
 
+    def test_manual_judging_requires_public_riddle_and_has_no_fixed_answer(
+        self,
+    ) -> None:
+        riddle = self.database.create_riddle(
+            guild_id=1,
+            channel_id=10,
+            creator_id=100,
+            mode="riddle",
+            question="写真で一言",
+            answer_display="",
+            deadline_at=self.now + timedelta(hours=1),
+            created_at=self.now,
+            public_answers=True,
+            answer_limit=2,
+            manual_judging=True,
+        )
+
+        self.assertTrue(riddle.manual_judging)
+        self.assertEqual(riddle.normalized_answers, ())
+        result = self.database.submit_answer(
+            riddle.id,
+            501,
+            "これは面白い回答",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.assertEqual(result.status, SubmissionStatus.WRONG)
+        self.assertEqual(self.database.list_winner_ids(riddle.id), ())
+
+        with self.assertRaisesRegex(ValueError, "回答公開"):
+            self.database.create_riddle(
+                guild_id=1,
+                channel_id=10,
+                creator_id=101,
+                mode="riddle",
+                question="非公開にはできない",
+                answer_display="",
+                deadline_at=self.now + timedelta(hours=1),
+                public_answers=False,
+                manual_judging=True,
+            )
+
+    def test_public_answer_mapping_and_creator_acceptance_are_persistent(
+        self,
+    ) -> None:
+        riddle = self.create_riddle(public_answers=True)
+        secret_submission = "DBには残してはいけない珍回答"
+        result = self.database.submit_answer(
+            riddle.id,
+            501,
+            secret_submission,
+            now=self.now + timedelta(minutes=1),
+        )
+        self.assertEqual(result.status, SubmissionStatus.WRONG)
+        mapping = self.database.register_public_answer_message(
+            message_id=900,
+            riddle_id=riddle.id,
+            user_id=501,
+            attempt_count=1,
+            posted_at=self.now + timedelta(minutes=1),
+        )
+        self.assertEqual(mapping.message_id, 900)
+        self.assertIsNone(mapping.accepted_at)
+
+        forbidden = self.database.accept_public_answer_message(
+            900,
+            999,
+            now=self.now + timedelta(minutes=2),
+        )
+        self.assertEqual(forbidden.status, ManualAcceptanceStatus.FORBIDDEN)
+        accepted = self.database.accept_public_answer_message(
+            900,
+            riddle.creator_id,
+            now=self.now + timedelta(minutes=2),
+        )
+        self.assertEqual(accepted.status, ManualAcceptanceStatus.ACCEPTED)
+        self.assertEqual(self.database.list_winner_ids(riddle.id), (501,))
+        first_accepted_at = accepted.answer_message.accepted_at
+
+        repeated = self.database.accept_public_answer_message(
+            900,
+            riddle.creator_id,
+            now=self.now + timedelta(minutes=3),
+        )
+        self.assertEqual(
+            repeated.status,
+            ManualAcceptanceStatus.ALREADY_ACCEPTED,
+        )
+        self.assertEqual(repeated.answer_message.accepted_at, first_accepted_at)
+        self.assertEqual(self.database.list_winner_ids(riddle.id), (501,))
+
+        reopened = RiddleDatabase(self.database_path)
+        self.assertEqual(
+            reopened.get_public_answer_message(900), repeated.answer_message
+        )
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            dump = "\n".join(connection.iterdump())
+        self.assertNotIn(secret_submission, dump)
+
+    def test_ogiri_mvp_is_creator_only_and_idempotent(self) -> None:
+        riddle = self.database.create_riddle(
+            guild_id=1,
+            channel_id=10,
+            creator_id=100,
+            mode="riddle",
+            question="写真で一言",
+            answer_display="",
+            deadline_at=self.now + timedelta(hours=1),
+            created_at=self.now,
+            public_answers=True,
+            manual_judging=True,
+        )
+        self.database.submit_answer(
+            riddle.id,
+            501,
+            "MVP候補",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.database.register_public_answer_message(
+            message_id=910,
+            riddle_id=riddle.id,
+            user_id=501,
+            attempt_count=1,
+        )
+
+        forbidden = self.database.mark_public_answer_mvp(910, 999, now=self.now)
+        self.assertEqual(forbidden.status, ManualAcceptanceStatus.FORBIDDEN)
+        selected = self.database.mark_public_answer_mvp(
+            910,
+            riddle.creator_id,
+            now=self.now + timedelta(minutes=2),
+        )
+        self.assertEqual(selected.status, ManualAcceptanceStatus.MVP_MARKED)
+        self.assertIsNotNone(selected.answer_message.mvp_at)
+        self.assertEqual(self.database.list_mvp_user_ids(riddle.id), (501,))
+        self.assertEqual(self.database.list_winner_ids(riddle.id), ())
+
+        repeated = self.database.mark_public_answer_mvp(
+            910,
+            riddle.creator_id,
+            now=self.now + timedelta(minutes=3),
+        )
+        self.assertEqual(repeated.status, ManualAcceptanceStatus.ALREADY_MVP)
+        self.assertEqual(self.database.list_mvp_user_ids(riddle.id), (501,))
+        self.assertEqual(self.database.list_winner_ids(riddle.id), ())
+
+        accepted = self.database.accept_public_answer_message(
+            910,
+            riddle.creator_id,
+            now=self.now + timedelta(minutes=4),
+        )
+        self.assertEqual(accepted.status, ManualAcceptanceStatus.ACCEPTED)
+        self.assertEqual(self.database.list_winner_ids(riddle.id), (501,))
+
+        normal_riddle = self.create_riddle(
+            creator_id=101,
+            public_answers=True,
+        )
+        self.database.submit_answer(
+            normal_riddle.id,
+            502,
+            "不正解",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.database.register_public_answer_message(
+            message_id=911,
+            riddle_id=normal_riddle.id,
+            user_id=502,
+            attempt_count=1,
+        )
+        not_ogiri = self.database.mark_public_answer_mvp(
+            911,
+            normal_riddle.creator_id,
+            now=self.now + timedelta(minutes=2),
+        )
+        self.assertEqual(not_ogiri.status, ManualAcceptanceStatus.NOT_OGIRI)
+
+    def test_public_answer_mapping_rejects_invalid_or_duplicate_bindings(self) -> None:
+        private_riddle = self.create_riddle()
+        self.database.submit_answer(
+            private_riddle.id,
+            501,
+            "不正解",
+            now=self.now + timedelta(minutes=1),
+        )
+        with self.assertRaisesRegex(Exception, "公開回答"):
+            self.database.register_public_answer_message(
+                message_id=900,
+                riddle_id=private_riddle.id,
+                user_id=501,
+                attempt_count=1,
+            )
+
+        public_riddle = self.create_riddle(
+            creator_id=101,
+            public_answers=True,
+        )
+        self.database.submit_answer(
+            public_riddle.id,
+            501,
+            "不正解",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.database.register_public_answer_message(
+            message_id=901,
+            riddle_id=public_riddle.id,
+            user_id=501,
+            attempt_count=1,
+        )
+        with self.assertRaises(DiscordBindingError):
+            self.database.register_public_answer_message(
+                message_id=902,
+                riddle_id=public_riddle.id,
+                user_id=501,
+                attempt_count=1,
+            )
+        with self.assertRaisesRegex(ValueError, "未記録"):
+            self.database.register_public_answer_message(
+                message_id=903,
+                riddle_id=public_riddle.id,
+                user_id=501,
+                attempt_count=2,
+            )
+        unknown = self.database.accept_public_answer_message(999, 101)
+        self.assertEqual(unknown.status, ManualAcceptanceStatus.NOT_FOUND)
+
+    def test_public_answer_cannot_be_accepted_after_deadline(self) -> None:
+        riddle = self.create_riddle(public_answers=True)
+        self.database.submit_answer(
+            riddle.id,
+            501,
+            "不正解",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.database.register_public_answer_message(
+            message_id=900,
+            riddle_id=riddle.id,
+            user_id=501,
+            attempt_count=1,
+        )
+
+        result = self.database.accept_public_answer_message(
+            900,
+            riddle.creator_id,
+            now=riddle.deadline_at,
+        )
+
+        self.assertEqual(result.status, ManualAcceptanceStatus.EXPIRED)
+        self.assertEqual(result.riddle.status, "expired")
+        self.assertEqual(self.database.list_winner_ids(riddle.id), ())
+
     def test_briddle_accepts_exactly_one_concurrent_winner(self) -> None:
         riddle = self.create_riddle(
             mode="briddle",
@@ -267,7 +733,10 @@ class RiddleDatabaseTests(unittest.TestCase):
 
         def delete():
             barrier.wait()
-            return self.database.delete_active_riddle(riddle.id)
+            return self.database.delete_active_riddle(
+                riddle.id,
+                now=self.now + timedelta(minutes=1),
+            )
 
         def submit():
             barrier.wait()
@@ -304,8 +773,21 @@ class RiddleDatabaseTests(unittest.TestCase):
             now=self.now + timedelta(minutes=1),
         )
         self.assertEqual(result.status, SubmissionStatus.CORRECT)
-        self.assertIsNone(self.database.delete_active_riddle(riddle.id))
+        self.assertIsNone(self.database.delete_active_riddle(riddle.id, now=self.now))
         self.assertEqual(self.database.get_riddle(riddle.id).status, "solved")
+
+    def test_active_delete_refuses_a_problem_at_or_after_deadline(self) -> None:
+        deadline = self.now + timedelta(minutes=1)
+        riddle = self.create_riddle(deadline_at=deadline)
+
+        self.assertIsNone(self.database.delete_active_riddle(riddle.id, now=deadline))
+        stored = self.database.get_riddle(riddle.id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, "active")
+
+        expired = self.database.mark_riddle_expired(riddle.id, now=deadline)
+        self.assertIsNotNone(expired)
+        self.assertEqual(expired.status, "expired")
 
     def test_riddle_records_unique_correct_users_without_saving_wrong_text(
         self,
@@ -460,7 +942,11 @@ class RiddleDatabaseTests(unittest.TestCase):
 
     def test_user_summary_and_deletion_remove_all_user_references(self) -> None:
         owned = self.create_riddle(creator_id=501)
-        answered = self.create_riddle(creator_id=502, message_id=300)
+        answered = self.create_riddle(
+            creator_id=502,
+            message_id=300,
+            public_answers=True,
+        )
         self.database.update_user_preferences(
             1,
             501,
@@ -473,6 +959,13 @@ class RiddleDatabaseTests(unittest.TestCase):
             "blue whale",
             now=self.now + timedelta(minutes=1),
         )
+        self.database.register_public_answer_message(
+            message_id=400,
+            riddle_id=answered.id,
+            user_id=501,
+            attempt_count=1,
+            posted_at=self.now + timedelta(minutes=1),
+        )
 
         summary = self.database.get_user_data_summary(1, 501)
         self.assertEqual(summary.created_riddles, 1)
@@ -480,12 +973,14 @@ class RiddleDatabaseTests(unittest.TestCase):
         self.assertEqual(summary.correct_riddles, 1)
         self.assertEqual(summary.first_wins, 1)
         self.assertEqual(summary.answer_attempts, 1)
+        self.assertEqual(summary.public_answer_messages, 1)
         self.assertTrue(summary.has_preferences)
 
         deletion = self.database.delete_user_data(1, 501)
         self.assertEqual(deletion.deleted_riddles, 1)
         self.assertEqual(deletion.deleted_winner_entries, 1)
         self.assertEqual(deletion.deleted_answer_attempts, 1)
+        self.assertEqual(deletion.deleted_public_answer_messages, 1)
         self.assertTrue(deletion.deleted_preferences)
         self.assertIsNone(self.database.get_riddle(owned.id))
         remaining = self.database.get_riddle(answered.id)
@@ -493,6 +988,7 @@ class RiddleDatabaseTests(unittest.TestCase):
         self.assertIsNone(remaining.winner_id)
         self.assertEqual(self.database.list_winner_ids(answered.id), ())
         self.assertEqual(self.database.get_answer_attempt_count(answered.id, 501), 0)
+        self.assertIsNone(self.database.get_public_answer_message(400))
         self.assertFalse(
             self.database.get_user_preferences(1, 501).public_answers,
         )
@@ -542,18 +1038,25 @@ class RiddleDatabaseTests(unittest.TestCase):
             public_answers=True,
             answer_limit=3,
         )
-        riddle = self.create_riddle()
+        riddle = self.create_riddle(public_answers=True)
         self.database.submit_answer(
             riddle.id,
             501,
             "blue whale",
             now=self.now + timedelta(minutes=1),
         )
+        self.database.register_public_answer_message(
+            message_id=400,
+            riddle_id=riddle.id,
+            user_id=501,
+            attempt_count=1,
+        )
 
         deletion = self.database.delete_guild_data(1)
         self.assertEqual(deletion.deleted_riddles, 1)
         self.assertEqual(deletion.deleted_winner_entries, 1)
         self.assertEqual(deletion.deleted_answer_attempts, 1)
+        self.assertEqual(deletion.deleted_public_answer_messages, 1)
         self.assertEqual(deletion.deleted_user_preferences, 1)
         self.assertTrue(deletion.deleted_settings)
         self.assertEqual(self.database.list_guild_ids(), [])

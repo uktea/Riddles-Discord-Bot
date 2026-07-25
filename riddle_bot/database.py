@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +26,12 @@ DEFAULT_MAX_ACTIVE = 10
 DEFAULT_MENTION_WINNERS = True
 DEFAULT_PUBLIC_ANSWERS = False
 DEFAULT_ANSWER_LIMIT: int | None = None
+DEFAULT_MANUAL_JUDGING = False
+DEFAULT_ANSWER_ACCEPT_EMOJI = "✅"
+DEFAULT_OGIRI_MVP_EMOJI = "👑"
+DEFAULT_GOOD_QUESTION_EMOJI = "⭐"
+OFFICIAL_EVALUATION_MARK_EMOJI = "🏆"
+CURRENT_SCHEMA_VERSION = 3
 ACTIVE_STATUS = "active"
 SOLVED_STATUS = "solved"
 EXPIRED_STATUS = "expired"
@@ -51,6 +59,10 @@ class DiscordBindingError(RiddleDatabaseError):
     """問題へDiscord IDを矛盾する形で再設定しようとした場合のエラー。"""
 
 
+class UnsupportedSchemaVersionError(RiddleDatabaseError):
+    """実行中コードより新しいDBスキーマを開こうとした場合のエラー。"""
+
+
 class SubmissionStatus(str, Enum):
     """回答受付の結果。"""
 
@@ -61,6 +73,20 @@ class SubmissionStatus(str, Enum):
     EXPIRED = "expired"
     NOT_FOUND = "not_found"
     LIMIT_REACHED = "limit_reached"
+
+
+class ManualAcceptanceStatus(str, Enum):
+    """公開回答への出題者採用の結果。"""
+
+    ACCEPTED = "accepted"
+    ALREADY_ACCEPTED = "already_accepted"
+    MVP_MARKED = "mvp_marked"
+    ALREADY_MVP = "already_mvp"
+    NOT_OGIRI = "not_ogiri"
+    FORBIDDEN = "forbidden"
+    CLOSED = "closed"
+    EXPIRED = "expired"
+    NOT_FOUND = "not_found"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +109,10 @@ class Riddle:
     created_at: datetime
     public_answers: bool = DEFAULT_PUBLIC_ANSWERS
     answer_limit: int | None = DEFAULT_ANSWER_LIMIT
+    manual_judging: bool = DEFAULT_MANUAL_JUDGING
+    answer_accept_emoji: str = DEFAULT_ANSWER_ACCEPT_EMOJI
+    ogiri_mvp_emoji: str = DEFAULT_OGIRI_MVP_EMOJI
+    good_question_emoji: str = DEFAULT_GOOD_QUESTION_EMOJI
 
     @property
     def normalized_answers(self) -> tuple[str, ...]:
@@ -104,6 +134,9 @@ class GuildSettings:
     allowed_channel_id: int | None = None
     max_active: int = DEFAULT_MAX_ACTIVE
     mention_winners: bool = DEFAULT_MENTION_WINNERS
+    answer_accept_emoji: str = DEFAULT_ANSWER_ACCEPT_EMOJI
+    ogiri_mvp_emoji: str = DEFAULT_OGIRI_MVP_EMOJI
+    good_question_emoji: str = DEFAULT_GOOD_QUESTION_EMOJI
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +191,26 @@ class SubmissionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicAnswerMessage:
+    """公開回答本文を除いた、Discordメッセージとの対応情報。"""
+
+    message_id: int
+    riddle_id: int
+    user_id: int
+    attempt_count: int
+    posted_at: datetime
+    accepted_at: datetime | None = None
+    mvp_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ManualAcceptanceResult:
+    status: ManualAcceptanceStatus
+    riddle: Riddle | None
+    answer_message: PublicAnswerMessage | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UserDataSummary:
     guild_id: int
     user_id: int
@@ -166,6 +219,7 @@ class UserDataSummary:
     correct_riddles: int
     first_wins: int
     answer_attempts: int = 0
+    public_answer_messages: int = 0
     has_preferences: bool = False
 
 
@@ -177,6 +231,7 @@ class UserDataDeletion:
     deleted_winner_entries: int
     cleared_winner_references: int
     deleted_answer_attempts: int = 0
+    deleted_public_answer_messages: int = 0
     deleted_preferences: bool = False
 
 
@@ -187,6 +242,7 @@ class GuildDataDeletion:
     deleted_winner_entries: int
     deleted_settings: bool
     deleted_answer_attempts: int = 0
+    deleted_public_answer_messages: int = 0
     deleted_user_preferences: int = 0
 
 
@@ -194,6 +250,56 @@ def _require_positive_integer(value: int, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field_name} は正の整数で指定してください。")
     return value
+
+
+def _validate_emoji_setting(value: str, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} は文字列で指定してください。")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > 100
+        or any(character.isspace() for character in normalized)
+    ):
+        raise ValueError(f"{field_name} は空白を含まない絵文字1件で指定してください。")
+    if emoji_identity_key(normalized) == emoji_identity_key(
+        OFFICIAL_EVALUATION_MARK_EMOJI
+    ):
+        raise ValueError(
+            f"{OFFICIAL_EVALUATION_MARK_EMOJI} はBotの公式記録マーク用のため"
+            "設定できません。"
+        )
+    return normalized
+
+
+def emoji_identity_key(value: str) -> tuple[str, str]:
+    """Discord上で同じリアクションになる絵文字の比較キーを返す。"""
+
+    custom_emoji = re.fullmatch(r"<a?:[^:>\s]+:(\d+)>", value)
+    if custom_emoji is not None:
+        # カスタム絵文字は改名後もsnowflake IDが同じ。
+        return ("custom", custom_emoji.group(1))
+
+    normalized = unicodedata.normalize("NFC", value)
+    normalized = normalized.replace("\N{VARIATION SELECTOR-15}", "").replace(
+        "\N{VARIATION SELECTOR-16}",
+        "",
+    )
+    return ("unicode", normalized)
+
+
+def _require_distinct_evaluation_emojis(
+    answer_accept_emoji: str,
+    ogiri_mvp_emoji: str,
+    good_question_emoji: str,
+) -> None:
+    identities = {
+        emoji_identity_key(answer_accept_emoji),
+        emoji_identity_key(ogiri_mvp_emoji),
+        emoji_identity_key(good_question_emoji),
+    }
+    if len(identities) != 3:
+        raise ValueError("3種類の評価絵文字はそれぞれ別の絵文字にしてください。")
 
 
 def _datetime_to_text(value: datetime) -> str:
@@ -223,6 +329,10 @@ def _riddle_from_row(row: sqlite3.Row) -> Riddle:
         created_at=_datetime_from_text(row["created_at"]),
         public_answers=bool(row["public_answers"]),
         answer_limit=row["answer_limit"],
+        manual_judging=bool(row["manual_judging"]),
+        answer_accept_emoji=row["answer_accept_emoji"],
+        ogiri_mvp_emoji=row["ogiri_mvp_emoji"],
+        good_question_emoji=row["good_question_emoji"],
     )
 
 
@@ -232,6 +342,9 @@ def _settings_from_row(row: sqlite3.Row) -> GuildSettings:
         allowed_channel_id=row["allowed_channel_id"],
         max_active=row["max_active"],
         mention_winners=bool(row["mention_winners"]),
+        answer_accept_emoji=row["answer_accept_emoji"],
+        ogiri_mvp_emoji=row["ogiri_mvp_emoji"],
+        good_question_emoji=row["good_question_emoji"],
     )
 
 
@@ -241,6 +354,22 @@ def _user_preferences_from_row(row: sqlite3.Row) -> UserPreferences:
         user_id=row["user_id"],
         public_answers=bool(row["public_answers"]),
         answer_limit=row["answer_limit"],
+    )
+
+
+def _public_answer_message_from_row(row: sqlite3.Row) -> PublicAnswerMessage:
+    accepted_at = row["accepted_at"]
+    mvp_at = row["mvp_at"]
+    return PublicAnswerMessage(
+        message_id=row["message_id"],
+        riddle_id=row["riddle_id"],
+        user_id=row["user_id"],
+        attempt_count=row["attempt_count"],
+        posted_at=_datetime_from_text(row["posted_at"]),
+        accepted_at=(
+            _datetime_from_text(accepted_at) if accepted_at is not None else None
+        ),
+        mvp_at=_datetime_from_text(mvp_at) if mvp_at is not None else None,
     )
 
 
@@ -290,6 +419,13 @@ class RiddleDatabase:
         """必要なテーブルと索引を冪等に作成する。"""
 
         with self._connect() as connection:
+            schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if schema_version > CURRENT_SCHEMA_VERSION:
+                raise UnsupportedSchemaVersionError(
+                    "このデータベースは新しいバージョンのBotで作成されています"
+                    f"（DB: v{schema_version} / 対応: v{CURRENT_SCHEMA_VERSION}）。"
+                    "対応するBotへ更新してください。"
+                )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS guild_settings (
@@ -298,7 +434,10 @@ class RiddleDatabase:
                     max_active INTEGER NOT NULL DEFAULT 10
                         CHECK (max_active >= 1),
                     mention_winners INTEGER NOT NULL DEFAULT 1
-                        CHECK (mention_winners IN (0, 1))
+                        CHECK (mention_winners IN (0, 1)),
+                    answer_accept_emoji TEXT NOT NULL DEFAULT '✅',
+                    ogiri_mvp_emoji TEXT NOT NULL DEFAULT '👑',
+                    good_question_emoji TEXT NOT NULL DEFAULT '⭐'
                 );
 
                 CREATE TABLE IF NOT EXISTS riddles (
@@ -323,7 +462,12 @@ class RiddleDatabase:
                         CHECK (
                             answer_limit IS NULL
                             OR answer_limit BETWEEN 1 AND 100
-                        )
+                        ),
+                    manual_judging INTEGER NOT NULL DEFAULT 0
+                        CHECK (manual_judging IN (0, 1)),
+                    answer_accept_emoji TEXT NOT NULL DEFAULT '✅',
+                    ogiri_mvp_emoji TEXT NOT NULL DEFAULT '👑',
+                    good_question_emoji TEXT NOT NULL DEFAULT '⭐'
                 );
 
                 CREATE TABLE IF NOT EXISTS riddle_winners (
@@ -342,6 +486,19 @@ class RiddleDatabase:
                         CHECK (attempt_count >= 1),
                     last_answered_at TEXT NOT NULL,
                     PRIMARY KEY (riddle_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS riddle_answer_messages (
+                    message_id INTEGER PRIMARY KEY,
+                    riddle_id INTEGER NOT NULL
+                        REFERENCES riddles(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL,
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count >= 1),
+                    posted_at TEXT NOT NULL,
+                    accepted_at TEXT,
+                    mvp_at TEXT,
+                    UNIQUE (riddle_id, user_id, attempt_count)
                 );
 
                 CREATE TABLE IF NOT EXISTS user_preferences (
@@ -369,12 +526,34 @@ class RiddleDatabase:
                     ON riddle_winners(user_id);
                 CREATE INDEX IF NOT EXISTS idx_riddle_attempts_user
                     ON riddle_attempts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_riddle_answer_messages_user
+                    ON riddle_answer_messages(user_id);
                 CREATE INDEX IF NOT EXISTS idx_user_preferences_user
                     ON user_preferences(user_id);
                 """
             )
             # CREATE TABLE IF NOT EXISTS は既存テーブルへ列を追加しないため、
             # V1のDBもデータを保持したまま新しい問題設定へ移行する。
+            guild_setting_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(guild_settings)"
+                ).fetchall()
+            }
+            for column_name, default_value in (
+                ("answer_accept_emoji", DEFAULT_ANSWER_ACCEPT_EMOJI),
+                ("ogiri_mvp_emoji", DEFAULT_OGIRI_MVP_EMOJI),
+                ("good_question_emoji", DEFAULT_GOOD_QUESTION_EMOJI),
+            ):
+                if column_name not in guild_setting_columns:
+                    escaped_default = default_value.replace("'", "''")
+                    connection.execute(
+                        f"""
+                        ALTER TABLE guild_settings
+                        ADD COLUMN {column_name} TEXT NOT NULL
+                            DEFAULT '{escaped_default}'
+                        """
+                    )
             riddle_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(riddles)").fetchall()
@@ -398,7 +577,42 @@ class RiddleDatabase:
                         )
                     """
                 )
-            connection.execute("PRAGMA user_version = 2")
+            if "manual_judging" not in riddle_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE riddles
+                    ADD COLUMN manual_judging INTEGER NOT NULL DEFAULT 0
+                        CHECK (manual_judging IN (0, 1))
+                    """
+                )
+            for column_name, default_value in (
+                ("answer_accept_emoji", DEFAULT_ANSWER_ACCEPT_EMOJI),
+                ("ogiri_mvp_emoji", DEFAULT_OGIRI_MVP_EMOJI),
+                ("good_question_emoji", DEFAULT_GOOD_QUESTION_EMOJI),
+            ):
+                if column_name not in riddle_columns:
+                    escaped_default = default_value.replace("'", "''")
+                    connection.execute(
+                        f"""
+                        ALTER TABLE riddles
+                        ADD COLUMN {column_name} TEXT NOT NULL
+                            DEFAULT '{escaped_default}'
+                        """
+                    )
+            answer_message_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(riddle_answer_messages)"
+                ).fetchall()
+            }
+            if "mvp_at" not in answer_message_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE riddle_answer_messages
+                    ADD COLUMN mvp_at TEXT
+                    """
+                )
+            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     def create_riddle(
         self,
@@ -415,6 +629,10 @@ class RiddleDatabase:
         created_at: datetime | None = None,
         public_answers: bool = DEFAULT_PUBLIC_ANSWERS,
         answer_limit: int | None = DEFAULT_ANSWER_LIMIT,
+        manual_judging: bool = DEFAULT_MANUAL_JUDGING,
+        answer_accept_emoji: str = DEFAULT_ANSWER_ACCEPT_EMOJI,
+        ogiri_mvp_emoji: str = DEFAULT_OGIRI_MVP_EMOJI,
+        good_question_emoji: str = DEFAULT_GOOD_QUESTION_EMOJI,
     ) -> Riddle:
         """問題を作成し、作成者単位の未終了問題数上限を原子的に守る。"""
 
@@ -427,11 +645,39 @@ class RiddleDatabase:
             message_id = _require_positive_integer(message_id, "message_id")
         if not isinstance(public_answers, bool):
             raise TypeError("public_answers は真偽値で指定してください。")
+        if not isinstance(manual_judging, bool):
+            raise TypeError("manual_judging は真偽値で指定してください。")
+        answer_accept_emoji = _validate_emoji_setting(
+            answer_accept_emoji,
+            "answer_accept_emoji",
+        )
+        ogiri_mvp_emoji = _validate_emoji_setting(
+            ogiri_mvp_emoji,
+            "ogiri_mvp_emoji",
+        )
+        good_question_emoji = _validate_emoji_setting(
+            good_question_emoji,
+            "good_question_emoji",
+        )
+        _require_distinct_evaluation_emojis(
+            answer_accept_emoji,
+            ogiri_mvp_emoji,
+            good_question_emoji,
+        )
         answer_limit = validate_answer_limit(answer_limit)
         normalized_mode = validate_mode(mode)
         if not isinstance(question, str) or not question.strip():
             raise ValueError("問題文を空にはできません。")
-        normalized_answers = prepare_answers(answer_display)
+        if manual_judging:
+            if normalized_mode != "riddle":
+                raise ValueError("手動採用方式はriddleでのみ利用できます。")
+            if not public_answers:
+                raise ValueError("手動採用方式では回答公開を有効にしてください。")
+            if answer_display:
+                raise ValueError("手動採用方式では正解文字列を指定できません。")
+            normalized_answers: tuple[str, ...] = ()
+        else:
+            normalized_answers = prepare_answers(answer_display)
         deadline_text = _datetime_to_text(deadline_at)
         created_text = _datetime_to_text(created_at or datetime.now(timezone.utc))
         answers_json = json.dumps(
@@ -467,11 +713,13 @@ class RiddleDatabase:
                     INSERT INTO riddles (
                         guild_id, channel_id, thread_id, message_id, creator_id,
                         mode, question, answer_display, answers_json, deadline_at,
-                        status, winner_id, created_at, public_answers, answer_limit
+                        status, winner_id, created_at, public_answers, answer_limit,
+                        manual_judging, answer_accept_emoji, ogiri_mvp_emoji,
+                        good_question_emoji
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        'active', NULL, ?, ?, ?
+                        'active', NULL, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -488,6 +736,10 @@ class RiddleDatabase:
                         created_text,
                         int(public_answers),
                         answer_limit,
+                        int(manual_judging),
+                        answer_accept_emoji,
+                        ogiri_mvp_emoji,
+                        good_question_emoji,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -1018,6 +1270,322 @@ class RiddleDatabase:
         with self._connect() as connection:
             return self._list_winner_ids_in_connection(connection, riddle_id)
 
+    def register_public_answer_message(
+        self,
+        *,
+        message_id: int,
+        riddle_id: int,
+        user_id: int,
+        attempt_count: int,
+        posted_at: datetime | None = None,
+    ) -> PublicAnswerMessage:
+        """公開回答本文を保存せず、Discordメッセージとの対応だけを登録する。"""
+
+        message_id = _require_positive_integer(message_id, "message_id")
+        riddle_id = _require_positive_integer(riddle_id, "riddle_id")
+        user_id = _require_positive_integer(user_id, "user_id")
+        attempt_count = _require_positive_integer(attempt_count, "attempt_count")
+        posted_text = _datetime_to_text(posted_at or datetime.now(timezone.utc))
+
+        with self._write_connection() as connection:
+            riddle_row = connection.execute(
+                """
+                SELECT * FROM riddles
+                WHERE id = ? AND public_answers = 1
+                """,
+                (riddle_id,),
+            ).fetchone()
+            if riddle_row is None:
+                raise RiddleNotFoundError("公開回答を紐付ける問題が見つかりません。")
+
+            recorded_attempt = self._get_answer_attempt_count_in_connection(
+                connection,
+                riddle_id,
+                user_id,
+            )
+            if attempt_count > recorded_attempt:
+                raise ValueError("未記録の回答回数へメッセージを紐付けられません。")
+
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO riddle_answer_messages (
+                        message_id, riddle_id, user_id, attempt_count, posted_at,
+                        accepted_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        message_id,
+                        riddle_id,
+                        user_id,
+                        attempt_count,
+                        posted_text,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DiscordBindingError(
+                    "その公開回答メッセージは既に登録されています。"
+                ) from exc
+            row = connection.execute(
+                """
+                SELECT * FROM riddle_answer_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+        return _public_answer_message_from_row(row)
+
+    def get_public_answer_message(
+        self,
+        message_id: int,
+    ) -> PublicAnswerMessage | None:
+        message_id = _require_positive_integer(message_id, "message_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM riddle_answer_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+        return _public_answer_message_from_row(row) if row is not None else None
+
+    def accept_public_answer_message(
+        self,
+        message_id: int,
+        evaluator_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> ManualAcceptanceResult:
+        """出題者の評価により、公開回答を正解・採用として原子的に記録する。"""
+
+        message_id = _require_positive_integer(message_id, "message_id")
+        evaluator_id = _require_positive_integer(evaluator_id, "evaluator_id")
+        accepted_text = _datetime_to_text(now or datetime.now(timezone.utc))
+
+        with self._write_connection() as connection:
+            answer_row = connection.execute(
+                """
+                SELECT * FROM riddle_answer_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            if answer_row is None:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.NOT_FOUND,
+                    None,
+                )
+
+            riddle_row = connection.execute(
+                "SELECT * FROM riddles WHERE id = ?",
+                (answer_row["riddle_id"],),
+            ).fetchone()
+            if riddle_row is None:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.NOT_FOUND,
+                    None,
+                )
+            riddle = _riddle_from_row(riddle_row)
+            answer_message = _public_answer_message_from_row(answer_row)
+
+            if evaluator_id != riddle.creator_id:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.FORBIDDEN,
+                    riddle,
+                    answer_message,
+                )
+            if riddle.status != ACTIVE_STATUS:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.CLOSED,
+                    riddle,
+                    answer_message,
+                )
+            if riddle_row["deadline_at"] <= accepted_text:
+                connection.execute(
+                    "UPDATE riddles SET status = 'expired' WHERE id = ?",
+                    (riddle.id,),
+                )
+                expired_row = connection.execute(
+                    "SELECT * FROM riddles WHERE id = ?",
+                    (riddle.id,),
+                ).fetchone()
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.EXPIRED,
+                    _riddle_from_row(expired_row),
+                    answer_message,
+                )
+            if answer_row["accepted_at"] is not None:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.ALREADY_ACCEPTED,
+                    riddle,
+                    answer_message,
+                )
+
+            connection.execute(
+                """
+                UPDATE riddle_answer_messages
+                SET accepted_at = ?
+                WHERE message_id = ? AND accepted_at IS NULL
+                """,
+                (accepted_text, message_id),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO riddle_winners
+                    (riddle_id, user_id, answered_at)
+                VALUES (?, ?, ?)
+                """,
+                (riddle.id, answer_message.user_id, accepted_text),
+            )
+            connection.execute(
+                """
+                UPDATE riddles
+                SET winner_id = COALESCE(winner_id, ?)
+                WHERE id = ? AND status = 'active'
+                """,
+                (answer_message.user_id, riddle.id),
+            )
+            updated_riddle_row = connection.execute(
+                "SELECT * FROM riddles WHERE id = ?",
+                (riddle.id,),
+            ).fetchone()
+            updated_answer_row = connection.execute(
+                """
+                SELECT * FROM riddle_answer_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+
+        return ManualAcceptanceResult(
+            ManualAcceptanceStatus.ACCEPTED,
+            _riddle_from_row(updated_riddle_row),
+            _public_answer_message_from_row(updated_answer_row),
+        )
+
+    def mark_public_answer_mvp(
+        self,
+        message_id: int,
+        evaluator_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> ManualAcceptanceResult:
+        """大喜利の公開回答を、出題者のMVPとして記録する。"""
+
+        message_id = _require_positive_integer(message_id, "message_id")
+        evaluator_id = _require_positive_integer(evaluator_id, "evaluator_id")
+        marked_text = _datetime_to_text(now or datetime.now(timezone.utc))
+
+        with self._write_connection() as connection:
+            answer_row = connection.execute(
+                """
+                SELECT * FROM riddle_answer_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            if answer_row is None:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.NOT_FOUND,
+                    None,
+                )
+
+            riddle_row = connection.execute(
+                "SELECT * FROM riddles WHERE id = ?",
+                (answer_row["riddle_id"],),
+            ).fetchone()
+            if riddle_row is None:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.NOT_FOUND,
+                    None,
+                )
+            riddle = _riddle_from_row(riddle_row)
+            answer_message = _public_answer_message_from_row(answer_row)
+
+            if evaluator_id != riddle.creator_id:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.FORBIDDEN,
+                    riddle,
+                    answer_message,
+                )
+            if not riddle.manual_judging:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.NOT_OGIRI,
+                    riddle,
+                    answer_message,
+                )
+            if riddle.status != ACTIVE_STATUS:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.CLOSED,
+                    riddle,
+                    answer_message,
+                )
+            if riddle_row["deadline_at"] <= marked_text:
+                connection.execute(
+                    "UPDATE riddles SET status = 'expired' WHERE id = ?",
+                    (riddle.id,),
+                )
+                expired_row = connection.execute(
+                    "SELECT * FROM riddles WHERE id = ?",
+                    (riddle.id,),
+                ).fetchone()
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.EXPIRED,
+                    _riddle_from_row(expired_row),
+                    answer_message,
+                )
+            if answer_row["mvp_at"] is not None:
+                return ManualAcceptanceResult(
+                    ManualAcceptanceStatus.ALREADY_MVP,
+                    riddle,
+                    answer_message,
+                )
+
+            connection.execute(
+                """
+                UPDATE riddle_answer_messages
+                SET mvp_at = ?
+                WHERE message_id = ? AND mvp_at IS NULL
+                """,
+                (marked_text, message_id),
+            )
+            updated_riddle_row = connection.execute(
+                "SELECT * FROM riddles WHERE id = ?",
+                (riddle.id,),
+            ).fetchone()
+            updated_answer_row = connection.execute(
+                """
+                SELECT * FROM riddle_answer_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+
+        return ManualAcceptanceResult(
+            ManualAcceptanceStatus.MVP_MARKED,
+            _riddle_from_row(updated_riddle_row),
+            _public_answer_message_from_row(updated_answer_row),
+        )
+
+    def list_mvp_user_ids(self, riddle_id: int) -> tuple[int, ...]:
+        """大喜利でMVPに選ばれたユーザーを、初回選出順で返す。"""
+
+        riddle_id = _require_positive_integer(riddle_id, "riddle_id")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id, MIN(mvp_at) AS first_mvp_at
+                FROM riddle_answer_messages
+                WHERE riddle_id = ? AND mvp_at IS NOT NULL
+                GROUP BY user_id
+                ORDER BY first_mvp_at, user_id
+                """,
+                (riddle_id,),
+            ).fetchall()
+        return tuple(row["user_id"] for row in rows)
+
     def delete_riddle(self, riddle_id: int) -> Riddle | None:
         """状態を問わず問題を物理削除し、削除前の値を返す。"""
 
@@ -1033,26 +1601,38 @@ class RiddleDatabase:
             connection.execute("DELETE FROM riddles WHERE id = ?", (riddle_id,))
         return riddle
 
-    def delete_active_riddle(self, riddle_id: int) -> Riddle | None:
-        """active問題だけを原子的に物理削除し、削除前の値を返す。
+    def delete_active_riddle(
+        self,
+        riddle_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> Riddle | None:
+        """期限前のactive問題だけを原子的に削除し、削除前の値を返す。
 
         正解受付と同じ ``BEGIN IMMEDIATE`` の書き込みロックを使うため、
         同時にbriddleの正解が届いてもsolvedへ移ったレコードを後から
-        取り消すことはない。
+        取り消さず、期限到達後の問題も削除しない。
         """
 
         riddle_id = _require_positive_integer(riddle_id, "riddle_id")
+        current_time = _datetime_to_text(now or datetime.now(timezone.utc))
         with self._write_connection() as connection:
             row = connection.execute(
-                "SELECT * FROM riddles WHERE id = ? AND status = 'active'",
-                (riddle_id,),
+                """
+                SELECT * FROM riddles
+                WHERE id = ? AND status = 'active' AND deadline_at > ?
+                """,
+                (riddle_id, current_time),
             ).fetchone()
             if row is None:
                 return None
             riddle = _riddle_from_row(row)
             cursor = connection.execute(
-                "DELETE FROM riddles WHERE id = ? AND status = 'active'",
-                (riddle_id,),
+                """
+                DELETE FROM riddles
+                WHERE id = ? AND status = 'active' AND deadline_at > ?
+                """,
+                (riddle_id, current_time),
             )
             if cursor.rowcount != 1:
                 return None
@@ -1094,6 +1674,9 @@ class RiddleDatabase:
         allowed_channel_id: int | None | object = _UNSET,
         max_active: int | object = _UNSET,
         mention_winners: bool | object = _UNSET,
+        answer_accept_emoji: str | object = _UNSET,
+        ogiri_mvp_emoji: str | object = _UNSET,
+        good_question_emoji: str | object = _UNSET,
     ) -> GuildSettings:
         """指定された設定項目だけ変更する。
 
@@ -1137,18 +1720,57 @@ class RiddleDatabase:
                     raise ValueError("mention_winners は真偽値で指定してください。")
                 next_mention = mention_winners
 
+            next_answer_accept_emoji = current.answer_accept_emoji
+            if answer_accept_emoji is not _UNSET:
+                next_answer_accept_emoji = _validate_emoji_setting(
+                    answer_accept_emoji,
+                    "answer_accept_emoji",
+                )
+
+            next_ogiri_mvp_emoji = current.ogiri_mvp_emoji
+            if ogiri_mvp_emoji is not _UNSET:
+                next_ogiri_mvp_emoji = _validate_emoji_setting(
+                    ogiri_mvp_emoji,
+                    "ogiri_mvp_emoji",
+                )
+
+            next_good_question_emoji = current.good_question_emoji
+            if good_question_emoji is not _UNSET:
+                next_good_question_emoji = _validate_emoji_setting(
+                    good_question_emoji,
+                    "good_question_emoji",
+                )
+
+            _require_distinct_evaluation_emojis(
+                next_answer_accept_emoji,
+                next_ogiri_mvp_emoji,
+                next_good_question_emoji,
+            )
+
             connection.execute(
                 """
                 INSERT INTO guild_settings (
-                    guild_id, allowed_channel_id, max_active, mention_winners
+                    guild_id, allowed_channel_id, max_active, mention_winners,
+                    answer_accept_emoji, ogiri_mvp_emoji, good_question_emoji
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     allowed_channel_id = excluded.allowed_channel_id,
                     max_active = excluded.max_active,
-                    mention_winners = excluded.mention_winners
+                    mention_winners = excluded.mention_winners,
+                    answer_accept_emoji = excluded.answer_accept_emoji,
+                    ogiri_mvp_emoji = excluded.ogiri_mvp_emoji,
+                    good_question_emoji = excluded.good_question_emoji
                 """,
-                (guild_id, next_channel, next_max, int(next_mention)),
+                (
+                    guild_id,
+                    next_channel,
+                    next_max,
+                    int(next_mention),
+                    next_answer_accept_emoji,
+                    next_ogiri_mvp_emoji,
+                    next_good_question_emoji,
+                ),
             )
             updated = connection.execute(
                 "SELECT * FROM guild_settings WHERE guild_id = ?",
@@ -1283,6 +1905,15 @@ class RiddleDatabase:
                 """,
                 (guild_id, user_id),
             ).fetchone()["count"]
+            public_answer_messages = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM riddle_answer_messages AS messages
+                JOIN riddles ON riddles.id = messages.riddle_id
+                WHERE riddles.guild_id = ? AND messages.user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()["count"]
             has_preferences = (
                 connection.execute(
                     """
@@ -1301,6 +1932,7 @@ class RiddleDatabase:
             correct_riddles=correct,
             first_wins=first_wins,
             answer_attempts=answer_attempts,
+            public_answer_messages=public_answer_messages,
             has_preferences=has_preferences,
         )
 
@@ -1332,6 +1964,15 @@ class RiddleDatabase:
                 FROM riddle_attempts AS attempts
                 JOIN riddles ON riddles.id = attempts.riddle_id
                 WHERE riddles.guild_id = ? AND attempts.user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()["count"]
+            deleted_public_answer_messages = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM riddle_answer_messages AS messages
+                JOIN riddles ON riddles.id = messages.riddle_id
+                WHERE riddles.guild_id = ? AND messages.user_id = ?
                 """,
                 (guild_id, user_id),
             ).fetchone()["count"]
@@ -1372,6 +2013,16 @@ class RiddleDatabase:
             )
             connection.execute(
                 """
+                DELETE FROM riddle_answer_messages
+                WHERE user_id = ?
+                  AND riddle_id IN (
+                      SELECT id FROM riddles WHERE guild_id = ?
+                  )
+                """,
+                (user_id, guild_id),
+            )
+            connection.execute(
+                """
                 DELETE FROM user_preferences
                 WHERE guild_id = ? AND user_id = ?
                 """,
@@ -1392,6 +2043,7 @@ class RiddleDatabase:
             deleted_winner_entries=deleted_winner_entries,
             cleared_winner_references=cleared,
             deleted_answer_attempts=deleted_answer_attempts,
+            deleted_public_answer_messages=deleted_public_answer_messages,
             deleted_preferences=had_preferences,
         )
 
@@ -1423,6 +2075,15 @@ class RiddleDatabase:
                 """,
                 (guild_id,),
             ).fetchone()["count"]
+            deleted_public_answer_messages = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM riddle_answer_messages AS messages
+                JOIN riddles ON riddles.id = messages.riddle_id
+                WHERE riddles.guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()["count"]
             deleted_user_preferences = connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM user_preferences
@@ -1445,6 +2106,7 @@ class RiddleDatabase:
             deleted_winner_entries=deleted_winner_entries,
             deleted_settings=settings_cursor.rowcount > 0,
             deleted_answer_attempts=deleted_answer_attempts,
+            deleted_public_answer_messages=deleted_public_answer_messages,
             deleted_user_preferences=deleted_user_preferences,
         )
 

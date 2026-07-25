@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,10 +14,16 @@ from discord.ext import commands, tasks
 
 from riddle_bot.core import deadline_from_term, prepare_answers
 from riddle_bot.database import (
+    DEFAULT_ANSWER_ACCEPT_EMOJI,
+    DEFAULT_GOOD_QUESTION_EMOJI,
+    DEFAULT_OGIRI_MVP_EMOJI,
+    OFFICIAL_EVALUATION_MARK_EMOJI,
     ActiveRiddleLimitError,
+    ManualAcceptanceStatus,
     Riddle,
     RiddleDatabase,
     SubmissionStatus,
+    emoji_identity_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,12 +31,26 @@ logger = logging.getLogger(__name__)
 ANSWER_BUTTON_CUSTOM_ID = "riddle-bot:answer:v1"
 QUESTION_MAX_LENGTH = 1_000
 ANSWER_MAX_LENGTH = 500
+HINT_MAX_LENGTH = 1_000
 ANSWER_COOLDOWN_SECONDS = 2.0
 MEDIA_MAX_SIZE_BYTES = 25 * 1024 * 1024
 MEDIA_CONTENT_TYPE_PREFIXES = ("image/", "audio/", "video/")
 BLOCKED_MEDIA_CONTENT_TYPES = frozenset({"image/svg+xml"})
+ACCEPT_ANSWER_EMOJI = DEFAULT_ANSWER_ACCEPT_EMOJI
+OGIRI_MVP_EMOJI = DEFAULT_OGIRI_MVP_EMOJI
+GOOD_QUESTION_EMOJI = DEFAULT_GOOD_QUESTION_EMOJI
+ACCEPTED_ANSWER_EMOJI = OFFICIAL_EVALUATION_MARK_EMOJI
 
 NO_MENTIONS = discord.AllowedMentions.none()
+HINT_CONTROL_CHARACTER_TRANSLATION = str.maketrans(
+    {
+        "\\": "＼",
+        "|": "｜",
+        "@": "＠",
+        "<": "＜",
+        ">": "＞",
+    }
+)
 
 
 async def send_ephemeral(interaction: discord.Interaction, content: str) -> None:
@@ -204,6 +225,9 @@ class RiddleCog(commands.Cog):
         # 回答受付・公開投稿・終了処理を直列化し、終了後に遅れて公開回答が
         # スレッドを再オープンする競合を防ぐ。
         self._riddle_operation_lock = asyncio.Lock()
+        # /delete purge:true による意図的なthread削除を、
+        # on_thread_deleteが途中でDB削除しないよう識別する。
+        self._purging_thread_ids: set[int] = set()
 
     async def _db(self, function: Any, /, *args: Any, **kwargs: Any) -> Any:
         """同期SQLite操作をDiscordのイベントループ外で実行する。"""
@@ -213,15 +237,34 @@ class RiddleCog(commands.Cog):
     def is_allowed_guild(self, interaction: discord.Interaction) -> bool:
         """設定済みの場合は、対象サーバーからの操作だけを許可する。"""
 
-        config = getattr(self.bot, "config", None)
-        configured_guild_id = getattr(config, "guild_id", None)
-        if configured_guild_id is None:
-            return True
         guild_id = getattr(interaction, "guild_id", None)
         if guild_id is None:
             guild = getattr(interaction, "guild", None)
             guild_id = getattr(guild, "id", None)
+        return self._is_allowed_guild_id(guild_id)
+
+    def _is_allowed_guild_id(self, guild_id: int | None) -> bool:
+        config = getattr(self.bot, "config", None)
+        configured_guild_id = getattr(config, "guild_id", None)
+        if configured_guild_id is None:
+            return True
         return guild_id == configured_guild_id
+
+    @staticmethod
+    def _reaction_value(value: str) -> str | discord.PartialEmoji:
+        parsed = discord.PartialEmoji.from_str(value)
+        return parsed if parsed.id is not None else value
+
+    @staticmethod
+    def _emoji_matches(payload_emoji: discord.PartialEmoji, configured: str) -> bool:
+        expected = discord.PartialEmoji.from_str(configured)
+        if expected.id is not None:
+            return payload_emoji.id == expected.id
+        return (
+            payload_emoji.id is None
+            and payload_emoji.name is not None
+            and emoji_identity_key(payload_emoji.name) == emoji_identity_key(configured)
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.is_allowed_guild(interaction):
@@ -292,7 +335,12 @@ class RiddleCog(commands.Cog):
     async def _process_deadlines_once(self) -> None:
         now = datetime.now(timezone.utc)
         for riddle in await self._db(self.database.list_due_riddles, now):
-            await self._db(self.database.mark_riddle_expired, riddle.id, now=now)
+            async with self._riddle_operation_lock:
+                await self._db(
+                    self.database.mark_riddle_expired,
+                    riddle.id,
+                    now=now,
+                )
 
         for riddle in await self._db(self.database.list_pending_finalizations):
             try:
@@ -333,6 +381,11 @@ class RiddleCog(commands.Cog):
                 return
 
             winner_ids = await self._db(self.database.list_winner_ids, riddle.id)
+            mvp_user_ids = (
+                await self._db(self.database.list_mvp_user_ids, riddle.id)
+                if riddle.manual_judging
+                else ()
+            )
             settings = await self._db(
                 self.database.get_guild_settings,
                 riddle.guild_id,
@@ -343,6 +396,7 @@ class RiddleCog(commands.Cog):
                 winner_ids,
                 settings.mention_winners,
                 guild,
+                mvp_user_ids=mvp_user_ids,
             )
 
             thread: discord.Thread | None = None
@@ -441,25 +495,34 @@ class RiddleCog(commands.Cog):
         winner_ids: list[int],
         mention_winners: bool,
         guild: discord.Guild | None,
+        *,
+        mvp_user_ids: tuple[int, ...] | list[int] = (),
     ) -> tuple[str, discord.AllowedMentions]:
-        displayed_ids = winner_ids[:20]
-        if displayed_ids:
+        def display_users(user_ids: list[int] | tuple[int, ...]) -> str:
+            displayed_user_ids = list(user_ids[:20])
+            if not displayed_user_ids:
+                return "なし"
             if mention_winners:
-                winners = "、".join(f"<@{user_id}>" for user_id in displayed_ids)
+                displayed_names = "、".join(
+                    f"<@{user_id}>" for user_id in displayed_user_ids
+                )
             else:
                 names: list[str] = []
-                for user_id in displayed_ids:
+                for user_id in displayed_user_ids:
                     member = guild.get_member(user_id) if guild is not None else None
                     names.append(
                         member.display_name
                         if member is not None
                         else f"ユーザー {user_id}"
                     )
-                winners = "、".join(names)
-            if len(winner_ids) > len(displayed_ids):
-                winners += f"、ほか{len(winner_ids) - len(displayed_ids)}名"
-        else:
-            winners = "なし"
+                displayed_names = "、".join(names)
+            if len(user_ids) > len(displayed_user_ids):
+                displayed_names += f"、ほか{len(user_ids) - len(displayed_user_ids)}名"
+            return displayed_names
+
+        displayed_ids = winner_ids[:20]
+        winners = display_users(winner_ids)
+        mvp_users = display_users(mvp_user_ids)
 
         reason = (
             "最初の正解者が決まりました"
@@ -471,18 +534,30 @@ class RiddleCog(commands.Cog):
             if len(riddle.question) <= 700
             else riddle.question[:697] + "…"
         )
-        content = (
-            f"**なぞなぞ #{riddle.id} — 終了**\n"
-            f"{shown_question}\n\n"
-            f"{reason}。\n"
-            f"**正解：** {riddle.answer_display}\n"
-            f"**正解者：** {winners}"
-        )
+        if riddle.manual_judging:
+            content = (
+                f"**大喜利 #{riddle.id} — 終了**\n"
+                f"{shown_question}\n\n"
+                f"{reason}。\n"
+                f"**MVP：** {mvp_users}\n"
+                f"**採用された回答者：** {winners}\n"
+                "採用・MVPに選ばれた回答は、"
+                "スレッド内の🏆リアクションで確認できます。"
+            )
+        else:
+            content = (
+                f"**なぞなぞ #{riddle.id} — 終了**\n"
+                f"{shown_question}\n\n"
+                f"{reason}。\n"
+                f"**正解：** {riddle.answer_display}\n"
+                f"**正解者：** {winners}"
+            )
         if len(content) > 2_000:
             content = content[:1_950] + "\n…（表示を省略しました）"
 
+        mention_ids = list(dict.fromkeys([*displayed_ids, *list(mvp_user_ids[:20])]))
         allowed_users = (
-            [discord.Object(id=user_id) for user_id in displayed_ids]
+            [discord.Object(id=user_id) for user_id in mention_ids]
             if mention_winners
             else False
         )
@@ -564,16 +639,13 @@ class RiddleCog(commands.Cog):
                             result.attempt_count,
                         )
                         publication_failed = not published
-                    except (
-                        discord.Forbidden,
-                        discord.NotFound,
-                        discord.HTTPException,
-                    ):
+                    except Exception as error:  # noqa: BLE001
                         publication_failed = True
                         logger.warning(
-                            "Could not publish answer for riddle %d user=%d",
+                            "Could not publish answer for riddle %d user=%d (%s)",
                             riddle.id,
                             user_id,
+                            type(error).__name__,
                         )
         finally:
             # 回答本文をインスタンス属性やログへ残さない。
@@ -667,11 +739,45 @@ class RiddleCog(commands.Cog):
         shown_answer = discord.utils.escape_markdown(
             discord.utils.escape_mentions(answer)
         )
-        await resolved.send(
+        message = await resolved.send(
             f"**{display_name}の回答（{attempt_count}回目）：** {shown_answer}",
             allowed_mentions=NO_MENTIONS,
             suppress_embeds=True,
         )
+        try:
+            await self._db(
+                self.database.register_public_answer_message,
+                message_id=message.id,
+                riddle_id=riddle.id,
+                user_id=user.id,
+                attempt_count=attempt_count,
+                posted_at=datetime.now(timezone.utc),
+            )
+        except Exception:
+            # 対応情報を永続化できない回答は再起動後に採用できないため、
+            # Discord側だけに孤立させない。
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not remove unregistered public answer riddle=%d",
+                    riddle.id,
+                )
+            raise
+        seed_emojis = [riddle.answer_accept_emoji]
+        if riddle.manual_judging:
+            seed_emojis.append(riddle.ogiri_mvp_emoji)
+        for configured_emoji in seed_emojis:
+            try:
+                # 出題者は既存の設定絵文字をクリックするだけで評価できる。
+                await message.add_reaction(self._reaction_value(configured_emoji))
+            except discord.HTTPException:
+                # 絵文字を新しく付ける権限がある場合は手動追加でも評価できる。
+                logger.warning(
+                    "Could not seed evaluation reaction riddle=%d message=%d",
+                    riddle.id,
+                    message.id,
+                )
         return True
 
     @app_commands.command(
@@ -738,17 +844,49 @@ class RiddleCog(commands.Cog):
             answer_limit=answer_limit,
         )
 
+    @app_commands.command(
+        name="ogiri",
+        description="回答を公開し、出題者が設定絵文字で採用する大喜利を作成します",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        theme="表示するお題",
+        term="回答期限。30m、2h、1d形式。省略時は24h",
+        answer_limit="1人あたりの回答回数。0は無制限、省略時は個人設定",
+        media="お題に添付する画像・音声・動画（1ファイルまで）",
+    )
+    async def ogiri(
+        self,
+        interaction: discord.Interaction,
+        theme: str,
+        term: str | None = None,
+        answer_limit: app_commands.Range[int, 0, 100] | None = None,
+        media: discord.Attachment | None = None,
+    ) -> None:
+        await self._create_riddle(
+            interaction,
+            mode="riddle",
+            question=theme,
+            answer=None,
+            term=term,
+            media=media,
+            public_answers=True,
+            answer_limit=answer_limit,
+            manual_judging=True,
+        )
+
     async def _create_riddle(
         self,
         interaction: discord.Interaction,
         *,
         mode: str,
         question: str,
-        answer: str,
+        answer: str | None,
         term: str | None,
         media: discord.Attachment | None,
         public_answers: bool | None = None,
         answer_limit: int | None = None,
+        manual_judging: bool = False,
     ) -> None:
         guild = interaction.guild
         channel = interaction.channel
@@ -760,7 +898,7 @@ class RiddleCog(commands.Cog):
             return
 
         question = question.strip()
-        answer = answer.strip()
+        answer = "" if answer is None else answer.strip()
         if not question:
             await send_ephemeral(interaction, "エラー！：問題文を入力してください。")
             return
@@ -770,10 +908,10 @@ class RiddleCog(commands.Cog):
                 f"エラー！：問題文は{QUESTION_MAX_LENGTH}文字以内にしてください。",
             )
             return
-        if not answer:
+        if not manual_judging and not answer:
             await send_ephemeral(interaction, "エラー！：正解を入力してください。")
             return
-        if len(answer) > ANSWER_MAX_LENGTH:
+        if not manual_judging and len(answer) > ANSWER_MAX_LENGTH:
             await send_ephemeral(
                 interaction,
                 f"エラー！：正解は{ANSWER_MAX_LENGTH}文字以内にしてください。",
@@ -781,7 +919,8 @@ class RiddleCog(commands.Cog):
             return
 
         try:
-            prepare_answers(answer)
+            if not manual_judging:
+                prepare_answers(answer)
             deadline = deadline_from_term(
                 term,
                 now=datetime.now(timezone.utc),
@@ -815,6 +954,8 @@ class RiddleCog(commands.Cog):
         else:
             effective_public_answers = False
             effective_answer_limit = None
+        if manual_judging:
+            effective_public_answers = True
 
         if (
             settings.allowed_channel_id is not None
@@ -830,6 +971,7 @@ class RiddleCog(commands.Cog):
             guild,
             channel,
             needs_media=media is not None,
+            needs_answer_reactions=True,
         )
         if missing_permissions:
             await send_ephemeral(
@@ -855,6 +997,10 @@ class RiddleCog(commands.Cog):
                 deadline_at=deadline,
                 public_answers=effective_public_answers,
                 answer_limit=effective_answer_limit,
+                manual_judging=manual_judging,
+                answer_accept_emoji=settings.answer_accept_emoji,
+                ogiri_mvp_emoji=settings.ogiri_mvp_emoji,
+                good_question_emoji=settings.good_question_emoji,
             )
 
             initial_content = self._open_content(
@@ -874,10 +1020,11 @@ class RiddleCog(commands.Cog):
                 attachments=attachments,
                 allowed_mentions=NO_MENTIONS,
             )
+            thread_label = "大喜利" if created.manual_judging else "なぞなぞ"
             thread = await message.create_thread(
-                name=f"なぞなぞ-{created.id}",
+                name=f"{thread_label}-{created.id}",
                 auto_archive_duration=self._auto_archive_duration(created.deadline_at),
-                reason=f"なぞなぞ #{created.id} の回答スレッド",
+                reason=f"{thread_label} #{created.id} の回答スレッド",
             )
             prompt_message = await thread.send(
                 "回答フォームを準備しています…",
@@ -904,11 +1051,15 @@ class RiddleCog(commands.Cog):
                 view=AnswerView(self),
                 allowed_mentions=NO_MENTIONS,
             )
+            await message.add_reaction(
+                self._reaction_value(created.good_question_emoji)
+            )
             logger.info(
-                "Created riddle id=%d guild=%d mode=%s",
+                "Created riddle id=%d guild=%d mode=%s manual_judging=%s",
                 created.id,
                 guild.id,
                 mode,
+                manual_judging,
             )
         except ActiveRiddleLimitError:
             await interaction.edit_original_response(
@@ -950,6 +1101,7 @@ class RiddleCog(commands.Cog):
         channel: discord.TextChannel,
         *,
         needs_media: bool = False,
+        needs_answer_reactions: bool = False,
     ) -> list[str]:
         member = guild.me
         if member is None:
@@ -965,6 +1117,8 @@ class RiddleCog(commands.Cog):
         ]
         if needs_media:
             required.append(("attach_files", "ファイルの添付"))
+        if needs_answer_reactions:
+            required.append(("add_reactions", "リアクションの追加"))
         return [
             label
             for attribute, label in required
@@ -1030,9 +1184,20 @@ class RiddleCog(commands.Cog):
         creator_name: str,
         thread: discord.Thread | None,
     ) -> str:
-        mode_description = (
-            "最初の正解で発表" if riddle.mode == "briddle" else "期限まで正誤を非公開"
-        )
+        if riddle.manual_judging:
+            heading = "大喜利"
+            mode_description = (
+                "回答を公開し、出題者が"
+                f"{riddle.answer_accept_emoji}で採用・"
+                f"{riddle.ogiri_mvp_emoji}でMVP選出"
+            )
+        else:
+            heading = "なぞなぞ"
+            mode_description = (
+                "最初の正解で発表"
+                if riddle.mode == "briddle"
+                else "期限まで正誤を非公開"
+            )
         deadline_timestamp = int(riddle.deadline_at.timestamp())
         thread_line = f"\n回答スレッド：{thread.mention}" if thread is not None else ""
         settings_lines = ""
@@ -1047,29 +1212,204 @@ class RiddleCog(commands.Cog):
             )
             settings_lines = f"\n回答文：{visibility}\n回答回数：{limit}"
         return (
-            f"**なぞなぞ #{riddle.id}**\n"
+            f"**{heading} #{riddle.id}**\n"
             f"{riddle.question}\n\n"
             f"作成者：{creator_name}\n"
             f"方式：{mode_description}\n"
             f"期限：<t:{deadline_timestamp}:F>（<t:{deadline_timestamp}:R>）"
             f"{settings_lines}"
             f"{thread_line}\n"
-            "下の「回答する」ボタンから回答してください。"
+            "下の「回答する」ボタンから回答してください。\n"
+            f"良い問題だと思ったら {riddle.good_question_emoji} で評価できます。"
         )
 
     def _answer_prompt_content(self, riddle: Riddle) -> str:
-        visibility = (
-            "入力した回答文は回答者名とともにこのスレッドへ公開されます。"
-            "正誤は期限まで表示されません。"
-            if riddle.public_answers
-            else "入力内容は他の参加者には表示されません。"
-        )
+        if riddle.manual_judging:
+            visibility = (
+                "入力した回答文は回答者名とともにこのスレッドへ公開されます。"
+                f"出題者は回答の{riddle.answer_accept_emoji}で採用、"
+                f"{riddle.ogiri_mvp_emoji}でMVPにできます。"
+                "Botの🏆が採用またはMVP記録済みの印です。"
+            )
+        elif riddle.public_answers:
+            visibility = (
+                "入力した回答文は回答者名とともにこのスレッドへ公開されます。"
+                "自動判定の正誤は期限まで表示されません。"
+                "出題者は想定外の回答でも"
+                f"{riddle.answer_accept_emoji}を押して正解として採用できます。"
+                "Botの🏆が採用済みの印です。"
+            )
+        else:
+            visibility = "入力内容は他の参加者には表示されません。"
         limit = (
             ""
             if riddle.answer_limit is None
             else f" 1人{riddle.answer_limit}回まで回答できます。"
         )
         return f"下の「回答する」ボタンから答えを入力してください。{visibility}{limit}"
+
+    @app_commands.command(
+        name="hint",
+        description="自分の受付中問題へスポイラー形式のヒントを追加します",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        riddle_id="ヒントを追加する問題ID",
+        text="ヒント本文（本文またはメディアのどちらかは必須）",
+        media="スポイラー表示する画像・音声・動画（1ファイルまで）",
+    )
+    async def hint(
+        self,
+        interaction: discord.Interaction,
+        riddle_id: int,
+        text: str | None = None,
+        media: discord.Attachment | None = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None or riddle_id <= 0:
+            await send_ephemeral(interaction, "エラー！：問題IDが不正です。")
+            return
+
+        hint_text = text.strip() if text is not None else ""
+        if not hint_text and media is None:
+            await send_ephemeral(
+                interaction,
+                "エラー！：ヒント本文またはメディアを指定してください。",
+            )
+            return
+        if len(hint_text) > HINT_MAX_LENGTH:
+            await send_ephemeral(
+                interaction,
+                f"エラー！：ヒント本文は{HINT_MAX_LENGTH}文字以内にしてください。",
+            )
+            return
+        try:
+            if media is not None:
+                self._validate_media_attachment(
+                    media,
+                    server_size_limit=guild.filesize_limit,
+                )
+        except ValueError as exc:
+            await send_ephemeral(interaction, f"エラー！：{exc}")
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        riddle = await self._db(self.database.get_riddle, riddle_id)
+        if riddle is None or riddle.guild_id != guild.id:
+            await interaction.edit_original_response(
+                content="エラー！：指定された問題が見つかりません。"
+            )
+            return
+        if riddle.creator_id != interaction.user.id and not is_administrator(
+            interaction
+        ):
+            await interaction.edit_original_response(
+                content="エラー！：ヒントを追加できるのは作成者または管理者です。"
+            )
+            return
+        if riddle.status != "active":
+            await interaction.edit_original_response(
+                content="エラー！：この問題の回答受付は終了しています。"
+            )
+            return
+
+        uploaded_file: discord.File | None = None
+        try:
+            if media is not None:
+                uploaded_file = await media.to_file(spoiler=True)
+                if self._file_looks_like_svg(uploaded_file):
+                    raise ValueError("SVGは添付できません。")
+                original_filename = str(getattr(media, "filename", ""))
+                suffix_match = re.search(r"(\.[A-Za-z0-9]{1,8})$", original_filename)
+                safe_suffix = suffix_match.group(1).lower() if suffix_match else ""
+                uploaded_file.filename = f"SPOILER_hint-{riddle.id}{safe_suffix}"
+                uploaded_file.description = None
+
+            should_finalize = False
+            async with self._riddle_operation_lock:
+                current = await self._db(self.database.get_riddle, riddle.id)
+                if current is None or current.status != "active":
+                    await interaction.edit_original_response(
+                        content="エラー！：この問題の回答受付は終了しています。"
+                    )
+                    return
+                if current.deadline_at <= datetime.now(timezone.utc):
+                    await self._db(
+                        self.database.mark_riddle_expired,
+                        current.id,
+                        now=datetime.now(timezone.utc),
+                    )
+                    should_finalize = True
+                else:
+                    resolved = (
+                        await self._resolve_channel(current.thread_id)
+                        if current.thread_id is not None
+                        else None
+                    )
+                    if not isinstance(resolved, discord.Thread):
+                        await interaction.edit_original_response(
+                            content="エラー！：回答スレッドが見つかりません。"
+                        )
+                        return
+                    if resolved.archived:
+                        await resolved.edit(archived=False)
+
+                    content = f"**ヒント（問題 #{current.id}）**"
+                    if hint_text:
+                        # 外側の ``||`` を閉じたりメンションを発火させる文字を、
+                        # 1文字ずつ見た目の近い全角文字へ置き換える。Markdownの
+                        # バックスラッシュescapeを使わないため、入力が上限の
+                        # 1000文字でもDiscordの2000文字制限を超えない。
+                        spoiler_safe_hint = hint_text.translate(
+                            HINT_CONTROL_CHARACTER_TRANSLATION
+                        )
+                        content += f"\n||{spoiler_safe_hint}||"
+                    if uploaded_file is not None and not hint_text:
+                        content += "\n下のスポイラー付きメディアを開いてください。"
+                    send_options: dict[str, Any] = {
+                        "allowed_mentions": NO_MENTIONS,
+                        "suppress_embeds": True,
+                    }
+                    if uploaded_file is not None:
+                        send_options["file"] = uploaded_file
+                    await resolved.send(content, **send_options)
+
+            if should_finalize:
+                await interaction.edit_original_response(
+                    content="エラー！：回答期限を過ぎているためヒントを追加できません。"
+                )
+                await self._publish_finalization(riddle.id)
+                return
+
+            await interaction.edit_original_response(
+                content=f"問題 #{riddle.id} にヒントを追加しました。"
+            )
+            logger.info(
+                "Added hint riddle=%d guild=%d by user=%d media=%s",
+                riddle.id,
+                guild.id,
+                interaction.user.id,
+                media is not None,
+            )
+        except ValueError as exc:
+            await interaction.edit_original_response(content=f"エラー！：{exc}")
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            logger.warning(
+                "Could not publish hint riddle=%d guild=%d",
+                riddle.id,
+                guild.id,
+                exc_info=True,
+            )
+            await interaction.edit_original_response(
+                content=(
+                    "エラー！：ヒントを投稿できませんでした。"
+                    "Botのスレッド送信・添付権限を確認してください。"
+                )
+            )
+        finally:
+            if uploaded_file is not None:
+                uploaded_file.close()
+            hint_text = ""
 
     @app_commands.command(
         name="help",
@@ -1097,14 +1437,18 @@ class RiddleCog(commands.Cog):
 
     @app_commands.command(
         name="delete",
-        description="自分が作成した問題を取り消します（管理者は全問題を操作可能）",
+        description="自分の問題を取り消します。purgeで投稿とスレッドも完全削除できます",
     )
     @app_commands.guild_only()
-    @app_commands.describe(riddle_id="取り消す問題ID")
+    @app_commands.describe(
+        riddle_id="取り消す問題ID",
+        purge="trueなら問題投稿と回答スレッドも削除（元に戻せません）",
+    )
     async def delete(
         self,
         interaction: discord.Interaction,
         riddle_id: int,
+        purge: bool = False,
     ) -> None:
         guild = interaction.guild
         if guild is None or riddle_id <= 0:
@@ -1131,14 +1475,71 @@ class RiddleCog(commands.Cog):
             )
             return
 
-        async with self._riddle_operation_lock:
-            deleted = await self._db(self.database.delete_active_riddle, riddle.id)
-            if deleted is not None:
-                await self._close_discord_problem(
-                    deleted,
-                    heading="取消",
-                    detail=f"{interaction.user.display_name}さんが問題を取り消しました。",
+        expired_riddle_id: int | None = None
+        deleted: Riddle | None = None
+        try:
+            async with self._riddle_operation_lock:
+                current = await self._db(self.database.get_riddle, riddle.id)
+                operation_now = datetime.now(timezone.utc)
+                if (
+                    current is not None
+                    and current.guild_id == guild.id
+                    and current.status == "active"
+                    and current.deadline_at <= operation_now
+                ):
+                    expired = await self._db(
+                        self.database.mark_riddle_expired,
+                        current.id,
+                        now=operation_now,
+                    )
+                    if expired is not None:
+                        expired_riddle_id = expired.id
+                elif (
+                    current is not None
+                    and current.guild_id == guild.id
+                    and current.status == "active"
+                ):
+                    if purge:
+                        await self._purge_discord_problem(
+                            current,
+                            actor_id=interaction.user.id,
+                        )
+                    deleted = await self._db(
+                        self.database.delete_active_riddle,
+                        current.id,
+                        now=operation_now,
+                    )
+                    if deleted is not None and not purge:
+                        await self._close_discord_problem(
+                            deleted,
+                            heading="取消",
+                            detail=(
+                                f"{interaction.user.display_name}さんが"
+                                "問題を取り消しました。"
+                            ),
+                        )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Could not purge Discord resources riddle=%d guild=%d",
+                riddle.id,
+                guild.id,
+                exc_info=True,
+            )
+            await interaction.edit_original_response(
+                content=(
+                    "エラー！：問題投稿またはスレッドを完全削除できませんでした。"
+                    "Botの権限を確認してください。DBの問題データは保持しているため、"
+                    "権限修正後に同じコマンドを再実行できます。"
                 )
+            )
+            return
+
+        if expired_riddle_id is not None:
+            await interaction.edit_original_response(
+                content="エラー！：回答期限を過ぎているため削除できません。"
+            )
+            await self._publish_finalization(expired_riddle_id)
+            return
 
         if deleted is None:
             await interaction.edit_original_response(
@@ -1147,7 +1548,11 @@ class RiddleCog(commands.Cog):
             return
 
         await interaction.edit_original_response(
-            content=f"問題 #{riddle.id} を削除しました。"
+            content=(
+                f"問題 #{riddle.id} とDiscord上の投稿・スレッドを完全削除しました。"
+                if purge
+                else f"問題 #{riddle.id} を取り消しました。"
+            )
         )
         logger.info(
             "Deleted riddle id=%d guild=%d by user=%d",
@@ -1156,6 +1561,38 @@ class RiddleCog(commands.Cog):
             interaction.user.id,
         )
 
+    async def _purge_discord_problem(
+        self,
+        riddle: Riddle,
+        *,
+        actor_id: int,
+    ) -> None:
+        """スレッドと起点メッセージを削除する。失敗時は呼び出し側で再試行する。"""
+
+        if riddle.thread_id is not None:
+            resolved = await self._resolve_channel(riddle.thread_id)
+            if isinstance(resolved, discord.Thread):
+                self._purging_thread_ids.add(resolved.id)
+                try:
+                    await resolved.delete(
+                        reason=(
+                            f"Riddle #{riddle.id} purged by Discord user {actor_id}"
+                        )
+                    )
+                except discord.NotFound:
+                    self._purging_thread_ids.discard(resolved.id)
+                except discord.HTTPException:
+                    self._purging_thread_ids.discard(resolved.id)
+                    raise
+
+        channel = await self._resolve_channel(riddle.channel_id)
+        if isinstance(channel, discord.TextChannel) and riddle.thread_id is not None:
+            try:
+                starter = await channel.fetch_message(riddle.thread_id)
+                await starter.delete()
+            except discord.NotFound:
+                pass
+
     async def _close_discord_problem(
         self,
         riddle: Riddle,
@@ -1163,8 +1600,10 @@ class RiddleCog(commands.Cog):
         heading: str,
         detail: str,
     ) -> None:
+        problem_label = "大喜利" if riddle.manual_judging else "なぞなぞ"
         content = (
-            f"**なぞなぞ #{riddle.id} — {heading}**\n{riddle.question}\n\n{detail}"
+            f"**{problem_label} #{riddle.id} — {heading}**\n"
+            f"{riddle.question}\n\n{detail}"
         )
         channel = await self._resolve_channel(riddle.channel_id)
         if isinstance(channel, discord.TextChannel) and riddle.thread_id is not None:
@@ -1272,6 +1711,18 @@ class RiddleCog(commands.Cog):
                 name="正解者をメンション (mention_winners)",
                 value="mention_winners",
             ),
+            app_commands.Choice(
+                name="正解・採用リアクション (answer_accept_emoji)",
+                value="answer_accept_emoji",
+            ),
+            app_commands.Choice(
+                name="大喜利MVPリアクション (ogiri_mvp_emoji)",
+                value="ogiri_mvp_emoji",
+            ),
+            app_commands.Choice(
+                name="良問リアクション (good_question_emoji)",
+                value="good_question_emoji",
+            ),
         ]
     )
     async def pref(
@@ -1322,7 +1773,7 @@ class RiddleCog(commands.Cog):
                     max_active=max_active,
                 )
                 shown_value = str(updated.max_active)
-            else:
+            elif setting_name == "mention_winners":
                 mention_winners = self._parse_boolean(prefvalue)
                 updated = await self._db(
                     self.database.update_guild_settings,
@@ -1330,6 +1781,14 @@ class RiddleCog(commands.Cog):
                     mention_winners=mention_winners,
                 )
                 shown_value = "true" if updated.mention_winners else "false"
+            else:
+                emoji = self._parse_reaction_emoji(guild, prefvalue)
+                updated = await self._db(
+                    self.database.update_guild_settings,
+                    guild.id,
+                    **{setting_name: emoji},
+                )
+                shown_value = getattr(updated, setting_name)
         except (TypeError, ValueError) as exc:
             await interaction.edit_original_response(content=f"エラー！：{exc}")
             return
@@ -1475,6 +1934,71 @@ class RiddleCog(commands.Cog):
             )
         return limit
 
+    def _parse_reaction_emoji(
+        self,
+        guild: discord.Guild,
+        value: str,
+    ) -> str:
+        normalized = value.strip()
+        custom_match = re.fullmatch(
+            r"<a?:[A-Za-z0-9_]{2,32}:(\d{15,22})>",
+            normalized,
+        )
+        if custom_match is not None:
+            emoji = guild.get_emoji(int(custom_match.group(1)))
+            if emoji is None or not emoji.is_usable():
+                raise ValueError(
+                    "このサーバーでBotが利用できるカスタム絵文字を指定してください。"
+                )
+            return str(emoji)
+
+        if not normalized or len(normalized) > 32:
+            raise ValueError(
+                "Unicode絵文字1件、またはカスタム絵文字を指定してください。"
+            )
+        if any(character.isspace() for character in normalized):
+            raise ValueError("絵文字には空白を含められません。")
+
+        keycap_sequence = "\N{COMBINING ENCLOSING KEYCAP}" in normalized
+        regional_indicators = [
+            character
+            for character in normalized
+            if 0x1F1E6 <= ord(character) <= 0x1F1FF
+        ]
+        emoji_bases: list[str] = []
+        for character in normalized:
+            if character in {
+                "\N{VARIATION SELECTOR-16}",
+                "\N{ZERO WIDTH JOINER}",
+                "\N{COMBINING ENCLOSING KEYCAP}",
+            }:
+                continue
+            if keycap_sequence and character in "0123456789#*":
+                continue
+            category = unicodedata.category(character)
+            if category in {"So", "Sk"}:
+                if not (0x1F3FB <= ord(character) <= 0x1F3FF):
+                    emoji_bases.append(character)
+                continue
+            if category in {"Mn", "Me", "Cf"}:
+                continue
+            raise ValueError(
+                "Unicode絵文字1件、またはカスタム絵文字を指定してください。"
+            )
+
+        joined_sequence = "\N{ZERO WIDTH JOINER}" in normalized
+        valid_base_count = (
+            keycap_sequence
+            or (len(regional_indicators) == 2 and len(emoji_bases) == 2)
+            or (joined_sequence and len(emoji_bases) >= 2)
+            or len(emoji_bases) == 1
+        )
+        if not valid_base_count:
+            raise ValueError(
+                "Unicode絵文字1件、またはカスタム絵文字を指定してください。"
+            )
+        return normalized
+
     @app_commands.command(
         name="status",
         description="Botとデータベースの稼働状況を確認します",
@@ -1489,9 +2013,15 @@ class RiddleCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        active_count = await self._db(
-            self.database.count_active_riddles,
-            guild.id,
+        active_count, settings = await asyncio.gather(
+            self._db(
+                self.database.count_active_riddles,
+                guild.id,
+            ),
+            self._db(
+                self.database.get_guild_settings,
+                guild.id,
+            ),
         )
         latency_ms = round(self.bot.latency * 1_000)
         state = "稼働中" if self.bot.is_ready() else "接続準備中"
@@ -1500,7 +2030,10 @@ class RiddleCog(commands.Cog):
                 f"**Botステータス：{state}**\n"
                 f"Discord応答遅延：{latency_ms} ms\n"
                 f"受付中の問題：{active_count}件\n"
-                "データベース：接続正常"
+                "データベース：接続正常\n"
+                f"正解・採用：{settings.answer_accept_emoji} / "
+                f"大喜利MVP：{settings.ogiri_mvp_emoji} / "
+                f"良問：{settings.good_question_emoji}"
             )
         )
 
@@ -1531,6 +2064,8 @@ class RiddleCog(commands.Cog):
                 f"正解者としての記録：{summary.correct_riddles}件\n"
                 f"最初の正解者としての記録：{summary.first_wins}件\n"
                 f"受付中問題への回答回数：{summary.answer_attempts}回\n"
+                f"リアクション判定用の公開回答対応："
+                f"{summary.public_answer_messages}件\n"
                 f"個人設定：{'保存あり' if summary.has_preferences else '初期値'}\n\n"
                 "問題終了時に問題・回答記録は削除されます。"
             )
@@ -1587,6 +2122,8 @@ class RiddleCog(commands.Cog):
                 f"削除した問題：{deletion.deleted_riddles}件\n"
                 f"削除した正解者記録：{deletion.deleted_winner_entries}件\n"
                 f"削除した回答回数：{deletion.deleted_answer_attempts}回\n"
+                f"削除した公開回答対応："
+                f"{deletion.deleted_public_answer_messages}件\n"
                 f"削除した個人設定："
                 f"{'あり' if deletion.deleted_preferences else 'なし'}\n"
                 "Discord上であなた自身が投稿したメッセージと、"
@@ -1602,7 +2139,103 @@ class RiddleCog(commands.Cog):
         )
 
     @commands.Cog.listener()
+    async def on_raw_reaction_add(
+        self,
+        payload: discord.RawReactionActionEvent,
+    ) -> None:
+        """出題者の設定絵文字を、公開回答の採用・MVPとして記録する。"""
+
+        if payload.guild_id is None or not self._is_allowed_guild_id(payload.guild_id):
+            return
+        bot_user = getattr(self.bot, "user", None)
+        if bot_user is not None and payload.user_id == bot_user.id:
+            return
+
+        received_at = datetime.now(timezone.utc)
+        async with self._riddle_operation_lock:
+            answer_message = await self._db(
+                self.database.get_public_answer_message,
+                payload.message_id,
+            )
+            if answer_message is None:
+                return
+            riddle = await self._db(
+                self.database.get_riddle,
+                answer_message.riddle_id,
+            )
+            if riddle is None or riddle.guild_id != payload.guild_id:
+                return
+
+            if self._emoji_matches(payload.emoji, riddle.answer_accept_emoji):
+                evaluation = "accepted"
+                result = await self._db(
+                    self.database.accept_public_answer_message,
+                    payload.message_id,
+                    payload.user_id,
+                    now=received_at,
+                )
+                new_status = ManualAcceptanceStatus.ACCEPTED
+                acknowledgement_statuses = {
+                    ManualAcceptanceStatus.ACCEPTED,
+                    ManualAcceptanceStatus.ALREADY_ACCEPTED,
+                }
+            elif riddle.manual_judging and self._emoji_matches(
+                payload.emoji, riddle.ogiri_mvp_emoji
+            ):
+                evaluation = "mvp"
+                result = await self._db(
+                    self.database.mark_public_answer_mvp,
+                    payload.message_id,
+                    payload.user_id,
+                    now=received_at,
+                )
+                new_status = ManualAcceptanceStatus.MVP_MARKED
+                acknowledgement_statuses = {
+                    ManualAcceptanceStatus.MVP_MARKED,
+                    ManualAcceptanceStatus.ALREADY_MVP,
+                }
+            else:
+                return
+
+        if result.status is ManualAcceptanceStatus.EXPIRED:
+            if result.riddle is not None:
+                await self._publish_finalization(result.riddle.id)
+            return
+        if result.status not in acknowledgement_statuses:
+            return
+
+        resolved = await self._resolve_channel(payload.channel_id)
+        if not isinstance(resolved, discord.Thread):
+            return
+        try:
+            message = await resolved.fetch_message(payload.message_id)
+            await message.add_reaction(ACCEPTED_ANSWER_EMOJI)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            logger.warning(
+                "Could not acknowledge accepted answer message=%d",
+                payload.message_id,
+            )
+            return
+
+        if (
+            result.status is new_status
+            and result.riddle is not None
+            and result.answer_message is not None
+        ):
+            logger.info(
+                "Evaluated public answer riddle=%d answer_user=%d "
+                "evaluator=%d evaluation=%s",
+                result.riddle.id,
+                result.answer_message.user_id,
+                payload.user_id,
+                evaluation,
+            )
+
+    @commands.Cog.listener()
     async def on_thread_delete(self, thread: discord.Thread) -> None:
+        if thread.id in self._purging_thread_ids:
+            self._purging_thread_ids.discard(thread.id)
+            return
         async with self._riddle_operation_lock:
             riddle = await self._db(
                 self.database.get_riddle_by_thread,
