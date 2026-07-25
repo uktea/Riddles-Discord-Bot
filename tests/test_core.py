@@ -4,6 +4,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from riddle_bot.core import (
+    MAX_ANSWER_LIMIT,
+    AnswerLimitValidationError,
     AnswerValidationError,
     ModeValidationError,
     TermValidationError,
@@ -12,6 +14,7 @@ from riddle_bot.core import (
     normalize_answer,
     parse_term,
     prepare_answers,
+    validate_answer_limit,
     validate_mode,
 )
 
@@ -82,6 +85,18 @@ class AnswerTests(unittest.TestCase):
         self.assertEqual(validate_mode("riddle"), "riddle")
         with self.assertRaises(ModeValidationError):
             validate_mode("quiz")
+
+    def test_validates_answer_limit(self) -> None:
+        self.assertIsNone(validate_answer_limit(None))
+        self.assertEqual(validate_answer_limit(1), 1)
+        self.assertEqual(validate_answer_limit(MAX_ANSWER_LIMIT), MAX_ANSWER_LIMIT)
+
+        for value in (0, -1, MAX_ANSWER_LIMIT + 1, True, 1.5, "3"):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(AnswerLimitValidationError),
+            ):
+                validate_answer_limit(value)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

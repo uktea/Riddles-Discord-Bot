@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_TERM = timedelta(hours=24)
 MIN_TERM = timedelta(minutes=1)
 MAX_TERM = timedelta(days=30)
+MAX_ANSWER_LIMIT = 100
 VALID_MODES = frozenset({"briddle", "riddle"})
 
 _TERM_PATTERN = re.compile(r"(?P<amount>\d+)(?P<unit>[mhd])", re.IGNORECASE)
@@ -34,6 +35,10 @@ class AnswerValidationError(ValidationError):
 
 class ModeValidationError(ValidationError):
     """問題モードが不正な場合のエラー。"""
+
+
+class AnswerLimitValidationError(ValidationError):
+    """1ユーザーあたりの回答回数上限が不正な場合のエラー。"""
 
 
 def parse_term(value: str | None) -> timedelta:
@@ -141,3 +146,23 @@ def validate_mode(mode: str) -> str:
     if not isinstance(mode, str) or mode.casefold() not in VALID_MODES:
         raise ModeValidationError("モードは briddle または riddle を指定してください。")
     return mode.casefold()
+
+
+def validate_answer_limit(value: int | None) -> int | None:
+    """保存用の回答上限を検証する。
+
+    ``None`` は無制限を表す。Discordコマンドなど外部入力で ``0`` を
+    無制限として扱う変換は、保存層へ渡す前に呼び出し側で行う。
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AnswerLimitValidationError(
+            f"回答上限は1〜{MAX_ANSWER_LIMIT}の整数で指定してください。"
+        )
+    if not 1 <= value <= MAX_ANSWER_LIMIT:
+        raise AnswerLimitValidationError(
+            f"回答上限は1〜{MAX_ANSWER_LIMIT}、または無制限で指定してください。"
+        )
+    return value

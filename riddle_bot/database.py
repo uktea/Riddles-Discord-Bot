@@ -16,11 +16,14 @@ from .core import (
     answer_matches,
     as_utc,
     prepare_answers,
+    validate_answer_limit,
     validate_mode,
 )
 
 DEFAULT_MAX_ACTIVE = 10
 DEFAULT_MENTION_WINNERS = True
+DEFAULT_PUBLIC_ANSWERS = False
+DEFAULT_ANSWER_LIMIT: int | None = None
 ACTIVE_STATUS = "active"
 SOLVED_STATUS = "solved"
 EXPIRED_STATUS = "expired"
@@ -57,6 +60,7 @@ class SubmissionStatus(str, Enum):
     CLOSED = "closed"
     EXPIRED = "expired"
     NOT_FOUND = "not_found"
+    LIMIT_REACHED = "limit_reached"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +81,8 @@ class Riddle:
     status: str
     winner_id: int | None
     created_at: datetime
+    public_answers: bool = DEFAULT_PUBLIC_ANSWERS
+    answer_limit: int | None = DEFAULT_ANSWER_LIMIT
 
     @property
     def normalized_answers(self) -> tuple[str, ...]:
@@ -101,10 +107,22 @@ class GuildSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class UserPreferences:
+    """サーバーごとに保持する、問題作成時の個人既定値。"""
+
+    guild_id: int
+    user_id: int
+    public_answers: bool = DEFAULT_PUBLIC_ANSWERS
+    answer_limit: int | None = DEFAULT_ANSWER_LIMIT
+
+
+@dataclass(frozen=True, slots=True)
 class SubmissionResult:
     status: SubmissionStatus
     riddle: Riddle | None
     winner_ids: tuple[int, ...] = ()
+    attempt_count: int = 0
+    answer_limit: int | None = None
 
     @property
     def accepted(self) -> bool:
@@ -120,6 +138,24 @@ class SubmissionResult:
     def riddle_id(self) -> int | None:
         return self.riddle.id if self.riddle is not None else None
 
+    @property
+    def attempt_recorded(self) -> bool:
+        """今回の送信が回答回数へ加算されたか返す。"""
+
+        return self.status in {
+            SubmissionStatus.CORRECT,
+            SubmissionStatus.WRONG,
+            SubmissionStatus.ALREADY_CORRECT,
+        }
+
+    @property
+    def remaining_attempts(self) -> int | None:
+        """残り回答回数を返す。無制限の場合は ``None``。"""
+
+        if self.answer_limit is None:
+            return None
+        return max(0, self.answer_limit - self.attempt_count)
+
 
 @dataclass(frozen=True, slots=True)
 class UserDataSummary:
@@ -129,6 +165,8 @@ class UserDataSummary:
     active_created_riddles: int
     correct_riddles: int
     first_wins: int
+    answer_attempts: int = 0
+    has_preferences: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +176,8 @@ class UserDataDeletion:
     deleted_riddles: int
     deleted_winner_entries: int
     cleared_winner_references: int
+    deleted_answer_attempts: int = 0
+    deleted_preferences: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +186,8 @@ class GuildDataDeletion:
     deleted_riddles: int
     deleted_winner_entries: int
     deleted_settings: bool
+    deleted_answer_attempts: int = 0
+    deleted_user_preferences: int = 0
 
 
 def _require_positive_integer(value: int, field_name: str) -> int:
@@ -179,6 +221,8 @@ def _riddle_from_row(row: sqlite3.Row) -> Riddle:
         status=row["status"],
         winner_id=row["winner_id"],
         created_at=_datetime_from_text(row["created_at"]),
+        public_answers=bool(row["public_answers"]),
+        answer_limit=row["answer_limit"],
     )
 
 
@@ -188,6 +232,15 @@ def _settings_from_row(row: sqlite3.Row) -> GuildSettings:
         allowed_channel_id=row["allowed_channel_id"],
         max_active=row["max_active"],
         mention_winners=bool(row["mention_winners"]),
+    )
+
+
+def _user_preferences_from_row(row: sqlite3.Row) -> UserPreferences:
+    return UserPreferences(
+        guild_id=row["guild_id"],
+        user_id=row["user_id"],
+        public_answers=bool(row["public_answers"]),
+        answer_limit=row["answer_limit"],
     )
 
 
@@ -263,7 +316,14 @@ class RiddleDatabase:
                     status TEXT NOT NULL DEFAULT 'active'
                         CHECK (status IN ('active', 'solved', 'expired')),
                     winner_id INTEGER,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    public_answers INTEGER NOT NULL DEFAULT 0
+                        CHECK (public_answers IN (0, 1)),
+                    answer_limit INTEGER
+                        CHECK (
+                            answer_limit IS NULL
+                            OR answer_limit BETWEEN 1 AND 100
+                        )
                 );
 
                 CREATE TABLE IF NOT EXISTS riddle_winners (
@@ -272,6 +332,29 @@ class RiddleDatabase:
                     user_id INTEGER NOT NULL,
                     answered_at TEXT NOT NULL,
                     PRIMARY KEY (riddle_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS riddle_attempts (
+                    riddle_id INTEGER NOT NULL
+                        REFERENCES riddles(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL,
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count >= 1),
+                    last_answered_at TEXT NOT NULL,
+                    PRIMARY KEY (riddle_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    public_answers INTEGER NOT NULL DEFAULT 0
+                        CHECK (public_answers IN (0, 1)),
+                    answer_limit INTEGER
+                        CHECK (
+                            answer_limit IS NULL
+                            OR answer_limit BETWEEN 1 AND 100
+                        ),
+                    PRIMARY KEY (guild_id, user_id)
                 );
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_riddles_thread_id
@@ -284,8 +367,38 @@ class RiddleDatabase:
                     ON riddles(status, deadline_at);
                 CREATE INDEX IF NOT EXISTS idx_riddle_winners_user
                     ON riddle_winners(user_id);
+                CREATE INDEX IF NOT EXISTS idx_riddle_attempts_user
+                    ON riddle_attempts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_user_preferences_user
+                    ON user_preferences(user_id);
                 """
             )
+            # CREATE TABLE IF NOT EXISTS は既存テーブルへ列を追加しないため、
+            # V1のDBもデータを保持したまま新しい問題設定へ移行する。
+            riddle_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(riddles)").fetchall()
+            }
+            if "public_answers" not in riddle_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE riddles
+                    ADD COLUMN public_answers INTEGER NOT NULL DEFAULT 0
+                        CHECK (public_answers IN (0, 1))
+                    """
+                )
+            if "answer_limit" not in riddle_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE riddles
+                    ADD COLUMN answer_limit INTEGER
+                        CHECK (
+                            answer_limit IS NULL
+                            OR answer_limit BETWEEN 1 AND 100
+                        )
+                    """
+                )
+            connection.execute("PRAGMA user_version = 2")
 
     def create_riddle(
         self,
@@ -300,6 +413,8 @@ class RiddleDatabase:
         thread_id: int | None = None,
         message_id: int | None = None,
         created_at: datetime | None = None,
+        public_answers: bool = DEFAULT_PUBLIC_ANSWERS,
+        answer_limit: int | None = DEFAULT_ANSWER_LIMIT,
     ) -> Riddle:
         """問題を作成し、作成者単位の未終了問題数上限を原子的に守る。"""
 
@@ -310,6 +425,9 @@ class RiddleDatabase:
             thread_id = _require_positive_integer(thread_id, "thread_id")
         if message_id is not None:
             message_id = _require_positive_integer(message_id, "message_id")
+        if not isinstance(public_answers, bool):
+            raise TypeError("public_answers は真偽値で指定してください。")
+        answer_limit = validate_answer_limit(answer_limit)
         normalized_mode = validate_mode(mode)
         if not isinstance(question, str) or not question.strip():
             raise ValueError("問題文を空にはできません。")
@@ -349,9 +467,12 @@ class RiddleDatabase:
                     INSERT INTO riddles (
                         guild_id, channel_id, thread_id, message_id, creator_id,
                         mode, question, answer_display, answers_json, deadline_at,
-                        status, winner_id, created_at
+                        status, winner_id, created_at, public_answers, answer_limit
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?)
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        'active', NULL, ?, ?, ?
+                    )
                     """,
                     (
                         guild_id,
@@ -365,6 +486,8 @@ class RiddleDatabase:
                         answers_json,
                         deadline_text,
                         created_text,
+                        int(public_answers),
+                        answer_limit,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -632,12 +755,14 @@ class RiddleDatabase:
         return [_riddle_from_row(row) for row in rows]
 
     def list_guild_ids(self) -> list[int]:
-        """設定または問題データが存在する全guild IDを返す。"""
+        """設定・個人設定・問題データが存在する全guild IDを返す。"""
 
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT guild_id FROM guild_settings
+                UNION
+                SELECT guild_id FROM user_preferences
                 UNION
                 SELECT guild_id FROM riddles
                 ORDER BY guild_id
@@ -723,6 +848,11 @@ class RiddleDatabase:
                 return SubmissionResult(SubmissionStatus.NOT_FOUND, None)
 
             riddle = _riddle_from_row(row)
+            attempt_count = self._get_answer_attempt_count_in_connection(
+                connection,
+                riddle.id,
+                user_id,
+            )
             if riddle.status != ACTIVE_STATUS:
                 result_status = (
                     SubmissionStatus.EXPIRED
@@ -733,6 +863,8 @@ class RiddleDatabase:
                     result_status,
                     riddle,
                     self._list_winner_ids_in_connection(connection, riddle.id),
+                    attempt_count,
+                    riddle.answer_limit,
                 )
 
             if row["deadline_at"] <= current_time:
@@ -748,14 +880,42 @@ class RiddleDatabase:
                     SubmissionStatus.EXPIRED,
                     _riddle_from_row(expired_row),
                     self._list_winner_ids_in_connection(connection, riddle.id),
+                    attempt_count,
+                    riddle.answer_limit,
+                )
+
+            if riddle.answer_limit is not None and attempt_count >= riddle.answer_limit:
+                return SubmissionResult(
+                    SubmissionStatus.LIMIT_REACHED,
+                    riddle,
+                    self._list_winner_ids_in_connection(connection, riddle.id),
+                    attempt_count,
+                    riddle.answer_limit,
                 )
 
             # answer は比較中だけメモリに存在し、DBへは一切書き込まない。
-            if not answer_matches(answer, riddle.normalized_answers):
+            is_correct = answer_matches(answer, riddle.normalized_answers)
+            connection.execute(
+                """
+                INSERT INTO riddle_attempts (
+                    riddle_id, user_id, attempt_count, last_answered_at
+                )
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(riddle_id, user_id) DO UPDATE SET
+                    attempt_count = riddle_attempts.attempt_count + 1,
+                    last_answered_at = excluded.last_answered_at
+                """,
+                (riddle.id, user_id, current_time),
+            )
+            attempt_count += 1
+
+            if not is_correct:
                 return SubmissionResult(
                     SubmissionStatus.WRONG,
                     riddle,
                     self._list_winner_ids_in_connection(connection, riddle.id),
+                    attempt_count,
+                    riddle.answer_limit,
                 )
 
             if riddle.mode == "briddle":
@@ -802,7 +962,41 @@ class RiddleDatabase:
                 (riddle.id,),
             ).fetchone()
             winner_ids = self._list_winner_ids_in_connection(connection, riddle.id)
-        return SubmissionResult(status, _riddle_from_row(updated_row), winner_ids)
+        return SubmissionResult(
+            status,
+            _riddle_from_row(updated_row),
+            winner_ids,
+            attempt_count,
+            riddle.answer_limit,
+        )
+
+    @staticmethod
+    def _get_answer_attempt_count_in_connection(
+        connection: sqlite3.Connection,
+        riddle_id: int,
+        user_id: int,
+    ) -> int:
+        row = connection.execute(
+            """
+            SELECT attempt_count
+            FROM riddle_attempts
+            WHERE riddle_id = ? AND user_id = ?
+            """,
+            (riddle_id, user_id),
+        ).fetchone()
+        return row["attempt_count"] if row is not None else 0
+
+    def get_answer_attempt_count(self, riddle_id: int, user_id: int) -> int:
+        """指定ユーザーが問題へ送信した、受付済み回答回数を返す。"""
+
+        riddle_id = _require_positive_integer(riddle_id, "riddle_id")
+        user_id = _require_positive_integer(user_id, "user_id")
+        with self._connect() as connection:
+            return self._get_answer_attempt_count_in_connection(
+                connection,
+                riddle_id,
+                user_id,
+            )
 
     @staticmethod
     def _list_winner_ids_in_connection(
@@ -962,6 +1156,92 @@ class RiddleDatabase:
             ).fetchone()
         return _settings_from_row(updated)
 
+    def get_user_preferences(
+        self,
+        guild_id: int,
+        user_id: int,
+    ) -> UserPreferences:
+        """問題作成者の個人既定値を返す。未保存なら初期値を返す。"""
+
+        guild_id = _require_positive_integer(guild_id, "guild_id")
+        user_id = _require_positive_integer(user_id, "user_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM user_preferences
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+        if row is None:
+            return UserPreferences(guild_id=guild_id, user_id=user_id)
+        return _user_preferences_from_row(row)
+
+    def update_user_preferences(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        public_answers: bool | object = _UNSET,
+        answer_limit: int | None | object = _UNSET,
+    ) -> UserPreferences:
+        """指定された個人既定値だけを更新する。
+
+        ``answer_limit=None`` を明示すると回答回数を無制限へ戻す。
+        """
+
+        guild_id = _require_positive_integer(guild_id, "guild_id")
+        user_id = _require_positive_integer(user_id, "user_id")
+        with self._write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM user_preferences
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            current = (
+                _user_preferences_from_row(row)
+                if row is not None
+                else UserPreferences(guild_id=guild_id, user_id=user_id)
+            )
+
+            next_public_answers = current.public_answers
+            if public_answers is not _UNSET:
+                if not isinstance(public_answers, bool):
+                    raise TypeError("public_answers は真偽値で指定してください。")
+                next_public_answers = public_answers
+
+            next_answer_limit = current.answer_limit
+            if answer_limit is not _UNSET:
+                next_answer_limit = validate_answer_limit(answer_limit)
+
+            connection.execute(
+                """
+                INSERT INTO user_preferences (
+                    guild_id, user_id, public_answers, answer_limit
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    public_answers = excluded.public_answers,
+                    answer_limit = excluded.answer_limit
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    int(next_public_answers),
+                    next_answer_limit,
+                ),
+            )
+            updated = connection.execute(
+                """
+                SELECT * FROM user_preferences
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+        return _user_preferences_from_row(updated)
+
     def get_user_data_summary(self, guild_id: int, user_id: int) -> UserDataSummary:
         guild_id = _require_positive_integer(guild_id, "guild_id")
         user_id = _require_positive_integer(user_id, "user_id")
@@ -994,6 +1274,25 @@ class RiddleDatabase:
                 """,
                 (guild_id, user_id),
             ).fetchone()["count"]
+            answer_attempts = connection.execute(
+                """
+                SELECT COALESCE(SUM(attempts.attempt_count), 0) AS count
+                FROM riddle_attempts AS attempts
+                JOIN riddles ON riddles.id = attempts.riddle_id
+                WHERE riddles.guild_id = ? AND attempts.user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()["count"]
+            has_preferences = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM user_preferences
+                    WHERE guild_id = ? AND user_id = ?
+                    """,
+                    (guild_id, user_id),
+                ).fetchone()
+                is not None
+            )
         return UserDataSummary(
             guild_id=guild_id,
             user_id=user_id,
@@ -1001,10 +1300,12 @@ class RiddleDatabase:
             active_created_riddles=created["active"],
             correct_riddles=correct,
             first_wins=first_wins,
+            answer_attempts=answer_attempts,
+            has_preferences=has_preferences,
         )
 
     def delete_user_data(self, guild_id: int, user_id: int) -> UserDataDeletion:
-        """ユーザー作成問題・正解者記録・winner参照を一括削除する。"""
+        """ユーザー作成問題・回答記録・個人設定を一括削除する。"""
 
         guild_id = _require_positive_integer(guild_id, "guild_id")
         user_id = _require_positive_integer(user_id, "user_id")
@@ -1025,6 +1326,25 @@ class RiddleDatabase:
                 """,
                 (guild_id, user_id),
             ).fetchone()["count"]
+            deleted_answer_attempts = connection.execute(
+                """
+                SELECT COALESCE(SUM(attempts.attempt_count), 0) AS count
+                FROM riddle_attempts AS attempts
+                JOIN riddles ON riddles.id = attempts.riddle_id
+                WHERE riddles.guild_id = ? AND attempts.user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()["count"]
+            had_preferences = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM user_preferences
+                    WHERE guild_id = ? AND user_id = ?
+                    """,
+                    (guild_id, user_id),
+                ).fetchone()
+                is not None
+            )
 
             connection.execute(
                 "DELETE FROM riddles WHERE guild_id = ? AND creator_id = ?",
@@ -1040,6 +1360,23 @@ class RiddleDatabase:
                 """,
                 (user_id, guild_id),
             )
+            connection.execute(
+                """
+                DELETE FROM riddle_attempts
+                WHERE user_id = ?
+                  AND riddle_id IN (
+                      SELECT id FROM riddles WHERE guild_id = ?
+                  )
+                """,
+                (user_id, guild_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM user_preferences
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
             cleared = connection.execute(
                 """
                 UPDATE riddles SET winner_id = NULL
@@ -1054,10 +1391,12 @@ class RiddleDatabase:
             deleted_riddles=deleted_riddles,
             deleted_winner_entries=deleted_winner_entries,
             cleared_winner_references=cleared,
+            deleted_answer_attempts=deleted_answer_attempts,
+            deleted_preferences=had_preferences,
         )
 
     def delete_guild_data(self, guild_id: int) -> GuildDataDeletion:
-        """Bot退出時にサーバー内の全問題・正解者・設定を即時削除する。"""
+        """Bot退出時にサーバー内の全問題・回答記録・設定を即時削除する。"""
 
         guild_id = _require_positive_integer(guild_id, "guild_id")
         with self._write_connection() as connection:
@@ -1075,9 +1414,29 @@ class RiddleDatabase:
                 """,
                 (guild_id,),
             ).fetchone()["count"]
+            deleted_answer_attempts = connection.execute(
+                """
+                SELECT COALESCE(SUM(attempts.attempt_count), 0) AS count
+                FROM riddle_attempts AS attempts
+                JOIN riddles ON riddles.id = attempts.riddle_id
+                WHERE riddles.guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()["count"]
+            deleted_user_preferences = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM user_preferences
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()["count"]
             connection.execute("DELETE FROM riddles WHERE guild_id = ?", (guild_id,))
             settings_cursor = connection.execute(
                 "DELETE FROM guild_settings WHERE guild_id = ?",
+                (guild_id,),
+            )
+            connection.execute(
+                "DELETE FROM user_preferences WHERE guild_id = ?",
                 (guild_id,),
             )
         return GuildDataDeletion(
@@ -1085,6 +1444,8 @@ class RiddleDatabase:
             deleted_riddles=deleted_riddles,
             deleted_winner_entries=deleted_winner_entries,
             deleted_settings=settings_cursor.rowcount > 0,
+            deleted_answer_attempts=deleted_answer_attempts,
+            deleted_user_preferences=deleted_user_preferences,
         )
 
 

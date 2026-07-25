@@ -64,10 +64,12 @@ LOG_LEVEL=INFO
 ```
 
 - `DISCORD_TOKEN=` の右側にDeveloper Portalで取得したBotトークンを入力します。
-- `DISCORD_GUILD_ID=` の右側に利用するサーバーIDを入力します。
+- `DISCORD_GUILD_ID=` の右側にコマンドを同期し、利用を許可するサーバーIDを入力します。
 - 通常は `DATABASE_PATH` と `LOG_LEVEL` を変更する必要はありません。
 
 Botトークンが入った `.env` を共有、添付、Gitへコミットしないでください。`.env.example` の `DISCORD_TOKEN` は常に空のままにします。
+
+`DISCORD_GUILD_ID` はDiscord Gatewayへの接続先ではありません。同じBotアカウントを招待したサーバーへBot自体は接続しますが、この値はコマンドの同期先と利用可能なサーバーを指定します。起動中のライブ切替には対応していないため、変更後はサービスを再起動してください。
 
 データ保存先を作成し、専用ユーザーだけがアクセスできるようにします。
 
@@ -90,7 +92,7 @@ sudo -u discordbot /bin/sh -c \
 確認する項目:
 
 1. ログにBotのログイン成功が表示される。
-2. 対象サーバーで `/status` が実行できる。
+2. 対象サーバーで `/help` と `/status` が実行できる。
 3. `/briddle` または `/riddle` で公開スレッドが作成される。
 4. スレッド内の「回答する」ボタンから回答できる。
 
@@ -178,7 +180,38 @@ sudo systemctl start riddles-discord-bot
 
 コードを入れ替える場合も、先にサービスを停止し、所有者が `discordbot:discordbot` のままであることを確認してから再開します。同じBotを手動起動とsystemdの両方から同時に動かさないでください。
 
-## 8. スリープを防止する
+## 8. 運用するDiscordサーバーを変更する
+
+未終了問題を残したまま切り替えないでください。次の順序で操作します。
+
+1. 旧サーバーで管理者が `/list` を確認し、未終了問題が終わるまで待つか、各問題を `/delete riddle_id` で取り消します。
+2. Developer Portalの招待URLを使い、同じBotアカウントを必要な権限付きで新サーバーへ招待します。
+3. 旧サーバーからBotを削除します。
+4. systemdサービスを停止します。
+
+```bash
+sudo systemctl stop riddles-discord-bot
+```
+
+5. `.env` を開き、`DISCORD_GUILD_ID` だけを新サーバーのIDへ変更して保存します。Botトークンの変更・再発行は不要です。
+
+```bash
+sudoedit /opt/riddles-discord-bot/.env
+```
+
+6. サービスを開始します。
+
+```bash
+sudo systemctl start riddles-discord-bot
+sudo systemctl status riddles-discord-bot
+```
+
+7. 新サーバーで `/help` と `/status` を実行します。
+8. 出題チャンネルを制限する場合は、そのチャンネルで管理者が `/pref allowed_channel current` を実行します。
+
+`/pref` の設定はサーバーごとに保存されるため、新サーバーでは `allowed_channel` を設定し直してください。`.env` の書き換えだけで起動中の接続先をライブ切替することはできません。
+
+## 9. スリープを防止する
 
 デスクトップPCやノートPCをサーバーとして使う場合、画面の自動消灯は問題ありませんが、サスペンド・休止状態になるとBotは停止します。デスクトップ環境の電源設定で、自動サスペンドを無効にしてください。
 
@@ -196,7 +229,7 @@ sudo systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.
 
 ノートPCでふたを閉じて運用する場合は、`/etc/systemd/logind.conf` の `HandleLidSwitch` 設定も関係します。ただし、ふたを閉じた状態での常時稼働は排熱に問題がないことを確認してください。停電後の自動起動が必要な場合は、PCのBIOS / UEFIにあるAC電源復帰設定も確認します。
 
-## 9. 停止・無効化・削除
+## 10. 停止・無効化・削除
 
 一時停止:
 
