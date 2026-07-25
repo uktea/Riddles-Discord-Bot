@@ -81,9 +81,11 @@ sudo chmod 700 /opt/riddles-discord-bot/data
 サービスを登録する前に、一度手動で起動します。
 
 ```bash
-cd /opt/riddles-discord-bot
-sudo -u discordbot .venv/bin/python main.py
+sudo -u discordbot /bin/sh -c \
+  'cd /opt/riddles-discord-bot && exec .venv/bin/python main.py'
 ```
+
+`/opt/riddles-discord-bot` は専用ユーザー `discordbot` のホームディレクトリとして作成されるため、通常のログインユーザーでは `cd` できない場合があります。上のコマンドは、ディレクトリの移動からBotの起動までを `discordbot` の権限で実行します。ディレクトリへ入るために `chmod 777` などで権限を広げる必要はありません。
 
 確認する項目:
 
