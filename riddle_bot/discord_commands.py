@@ -20,6 +20,7 @@ from riddle_bot.database import (
     OFFICIAL_EVALUATION_MARK_EMOJI,
     ActiveRiddleLimitError,
     ManualAcceptanceStatus,
+    ManualCloseStatus,
     Riddle,
     RiddleDatabase,
     SubmissionStatus,
@@ -33,6 +34,8 @@ QUESTION_MAX_LENGTH = 1_000
 ANSWER_MAX_LENGTH = 500
 HINT_MAX_LENGTH = 1_000
 ANSWER_COOLDOWN_SECONDS = 2.0
+BRIDDLE_MENTION_BATCH_SIZE = 50
+DEFERRED_ANSWER_PAGE_SIZE = 100
 MEDIA_MAX_SIZE_BYTES = 25 * 1024 * 1024
 MEDIA_CONTENT_TYPE_PREFIXES = ("image/", "audio/", "video/")
 BLOCKED_MEDIA_CONTENT_TYPES = frozenset({"image/svg+xml"})
@@ -40,6 +43,11 @@ ACCEPT_ANSWER_EMOJI = DEFAULT_ANSWER_ACCEPT_EMOJI
 OGIRI_MVP_EMOJI = DEFAULT_OGIRI_MVP_EMOJI
 GOOD_QUESTION_EMOJI = DEFAULT_GOOD_QUESTION_EMOJI
 ACCEPTED_ANSWER_EMOJI = OFFICIAL_EVALUATION_MARK_EMOJI
+BRIDDLE_WRONG_ANSWER_VISIBILITY_LABELS = {
+    "private": "非公開",
+    "immediate": "不正解直後に公開",
+    "after_close": "問題終了時に一括公開",
+}
 
 NO_MENTIONS = discord.AllowedMentions.none()
 HINT_CONTROL_CHARACTER_TRANSLATION = str.maketrans(
@@ -100,6 +108,7 @@ class AnswerModal(discord.ui.Modal, title="なぞなぞに回答"):
         source_message_id: int,
         *,
         public_answers: bool = False,
+        answer_notice: str | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.cog = cog
@@ -117,9 +126,12 @@ class AnswerModal(discord.ui.Modal, title="なぞなぞに回答"):
             discord.ui.Label(
                 text="回答",
                 description=(
-                    "入力内容は回答スレッドへ公開されます。"
-                    if public_answers
-                    else "入力内容は他の参加者には表示されません。"
+                    answer_notice
+                    or (
+                        "入力内容は回答スレッドへ公開されます。"
+                        if public_answers
+                        else "入力内容は他の参加者には表示されません。"
+                    )
                 ),
                 component=self.answer_input,
             )
@@ -191,6 +203,7 @@ class AnswerView(discord.ui.View):
                 self.cog,
                 interaction.message.id,
                 public_answers=riddle.public_answers,
+                answer_notice=self.cog._answer_modal_notice(riddle),
             )
         )
 
@@ -225,7 +238,7 @@ class RiddleCog(commands.Cog):
         # 回答受付・公開投稿・終了処理を直列化し、終了後に遅れて公開回答が
         # スレッドを再オープンする競合を防ぐ。
         self._riddle_operation_lock = asyncio.Lock()
-        # /delete purge:true による意図的なthread削除を、
+        # /delete による意図的なthread削除を、
         # on_thread_deleteが途中でDB削除しないよう識別する。
         self._purging_thread_ids: set[int] = set()
 
@@ -377,10 +390,15 @@ class RiddleCog(commands.Cog):
             if riddle is None or status_value(riddle.status) not in {
                 "solved",
                 "expired",
-            }:
+            } or riddle.finalized_at is not None:
                 return
 
             winner_ids = await self._db(self.database.list_winner_ids, riddle.id)
+            first_winner_at = (
+                await self._db(self.database.get_first_winner_at, riddle.id)
+                if winner_ids and not riddle.manual_judging
+                else None
+            )
             mvp_user_ids = (
                 await self._db(self.database.list_mvp_user_ids, riddle.id)
                 if riddle.manual_judging
@@ -397,6 +415,7 @@ class RiddleCog(commands.Cog):
                 settings.mention_winners,
                 guild,
                 mvp_user_ids=mvp_user_ids,
+                first_winner_at=first_winner_at,
             )
 
             thread: discord.Thread | None = None
@@ -404,6 +423,20 @@ class RiddleCog(commands.Cog):
                 resolved = await self._resolve_channel(riddle.thread_id)
                 if isinstance(resolved, discord.Thread):
                     thread = resolved
+
+            if (
+                thread is None
+                and riddle.mode == "briddle"
+                and riddle.wrong_answer_visibility == "after_close"
+            ):
+                missing_thread_notice = (
+                    "\n\n※回答スレッドが見つからないため、"
+                    "終了時公開に設定された不正解は表示できませんでした。"
+                )
+                content = (
+                    content[: 2_000 - len(missing_thread_notice)]
+                    + missing_thread_notice
+                )
 
             published = False
             starter_missing = riddle.thread_id is None
@@ -456,7 +489,10 @@ class RiddleCog(commands.Cog):
                         await thread.edit(archived=False)
                     prompt = await thread.fetch_message(riddle.message_id)
                     await prompt.edit(
-                        content="回答受付は終了しました。開始メッセージで結果を確認してください。",
+                        content=(
+                            "回答受付は終了しました。開始メッセージで結果を確認できます。"
+                            "このスレッドは感想戦に使ってください。"
+                        ),
                         view=ClosedAnswerView(),
                         allowed_mentions=NO_MENTIONS,
                     )
@@ -480,14 +516,40 @@ class RiddleCog(commands.Cog):
 
             if thread is not None:
                 try:
-                    await thread.edit(archived=True, locked=True)
-                except (discord.Forbidden, discord.NotFound):
-                    logger.warning(
-                        "Could not archive and lock thread for riddle %d",
+                    # 回答フォームだけを閉じ、会話は感想戦として継続できるよう
+                    # thread自体は開いたままにする。Discordの無操作時
+                    # auto-archiveは通常どおり機能する。
+                    await thread.edit(archived=False, locked=False)
+                except discord.NotFound:
+                    logger.info(
+                        "Discussion thread disappeared for riddle %d",
                         riddle.id,
                     )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning(
+                        "Could not keep discussion thread open for riddle %d",
+                        riddle.id,
+                    )
+                    # 一時的な権限・Discord障害ならDBを保持し、定期処理で
+                    # 結果表示とスレッド再オープンを再試行する。
+                    raise RuntimeError(
+                        "感想戦用スレッドを開いた状態にできません"
+                    ) from exc
 
-            await self._db(self.database.delete_finished_riddle, riddle.id)
+            if (
+                thread is not None
+                and riddle.mode == "briddle"
+                and riddle.wrong_answer_visibility == "after_close"
+            ):
+                await self._publish_deferred_briddle_answers(riddle, thread)
+
+            # Discord threadが既に削除されているなら、保持期限も終わっている。
+            # それ以外は再発表を防ぐ印だけ付け、問題IDとDiscord紐付けを
+            # /delete または on_thread_delete まで保持する。
+            if riddle.thread_id is not None and thread is None:
+                await self._db(self.database.delete_riddle, riddle.id)
+            else:
+                await self._db(self.database.finalize_riddle, riddle.id)
 
     def _finished_content(
         self,
@@ -497,6 +559,7 @@ class RiddleCog(commands.Cog):
         guild: discord.Guild | None,
         *,
         mvp_user_ids: tuple[int, ...] | list[int] = (),
+        first_winner_at: datetime | None = None,
     ) -> tuple[str, discord.AllowedMentions]:
         def display_users(user_ids: list[int] | tuple[int, ...]) -> str:
             displayed_user_ids = list(user_ids[:20])
@@ -523,12 +586,21 @@ class RiddleCog(commands.Cog):
         displayed_ids = winner_ids[:20]
         winners = display_users(winner_ids)
         mvp_users = display_users(mvp_user_ids)
-
-        reason = (
-            "最初の正解者が決まりました"
-            if status_value(riddle.status) == "solved"
-            else "期限になりました"
+        solving_time = (
+            ""
+            if first_winner_at is None
+            else (
+                "\n**最初の正解まで：** "
+                f"{self._format_elapsed_time(riddle.created_at, first_winner_at)}"
+            )
         )
+
+        if status_value(riddle.status) == "solved":
+            reason = f"規定の{riddle.winner_limit}人の正解者が決まりました"
+        elif riddle.closed_early_at is not None:
+            reason = "出題者または管理者が回答受付を締め切りました"
+        else:
+            reason = "期限になりました"
         shown_question = (
             riddle.question
             if len(riddle.question) <= 700
@@ -551,7 +623,9 @@ class RiddleCog(commands.Cog):
                 f"{reason}。\n"
                 f"**正解：** {riddle.answer_display}\n"
                 f"**正解者：** {winners}"
+                f"{solving_time}"
             )
+        content += "\n\n回答受付は終了しました。このスレッドは感想戦に使えます。"
         if len(content) > 2_000:
             content = content[:1_950] + "\n…（表示を省略しました）"
 
@@ -568,6 +642,78 @@ class RiddleCog(commands.Cog):
             replied_user=False,
         )
         return content, allowed_mentions
+
+    @staticmethod
+    def _format_elapsed_time(started_at: datetime, finished_at: datetime) -> str:
+        """2つのUTC日時の差を、読みやすい最大2単位の日本語へ整形する。"""
+
+        remaining = max(0, int((finished_at - started_at).total_seconds()))
+        units = (
+            ("日", 86_400),
+            ("時間", 3_600),
+            ("分", 60),
+            ("秒", 1),
+        )
+        parts: list[str] = []
+        for label, seconds_per_unit in units:
+            value, remaining = divmod(remaining, seconds_per_unit)
+            if value:
+                parts.append(f"{value}{label}")
+            if len(parts) == 2:
+                break
+        return "".join(parts) if parts else "0秒"
+
+    async def _publish_deferred_briddle_answers(
+        self,
+        riddle: Riddle,
+        thread: discord.Thread,
+    ) -> None:
+        heading = f"**なぞなぞ #{riddle.id} — 終了時公開の不正解**"
+
+        async def publish_chunk(
+            chunk_content: str,
+            chunk_answer_ids: tuple[int, ...],
+        ) -> None:
+            if not chunk_answer_ids:
+                return
+            await thread.send(
+                chunk_content,
+                allowed_mentions=NO_MENTIONS,
+                suppress_embeds=True,
+            )
+            await self._db(
+                self.database.mark_deferred_answers_disclosed,
+                chunk_answer_ids,
+                now=datetime.now(timezone.utc),
+            )
+
+        while True:
+            answers = await self._db(
+                self.database.list_pending_deferred_answers,
+                riddle.id,
+                limit=DEFERRED_ANSWER_PAGE_SIZE,
+            )
+            if not answers:
+                return
+
+            content = heading
+            answer_ids: list[int] = []
+
+            for answer in answers:
+                shown_answer = discord.utils.escape_markdown(
+                    discord.utils.escape_mentions(answer.answer_body)
+                )
+                line = (
+                    f"\n**<@{answer.user_id}>"
+                    f"（{answer.attempt_count}回目）：** {shown_answer}"
+                )
+                if len(content) + len(line) > 2_000 and answer_ids:
+                    await publish_chunk(content, tuple(answer_ids))
+                    content = heading
+                    answer_ids = []
+                content += line
+                answer_ids.append(answer.id)
+            await publish_chunk(content, tuple(answer_ids))
 
     async def handle_answer(
         self,
@@ -647,6 +793,50 @@ class RiddleCog(commands.Cog):
                             user_id,
                             type(error).__name__,
                         )
+                elif (
+                    riddle is not None
+                    and riddle.mode == "briddle"
+                    and result.status is SubmissionStatus.WRONG
+                    and riddle.wrong_answer_visibility == "immediate"
+                ):
+                    try:
+                        published = await self._publish_briddle_wrong_answer(
+                            riddle,
+                            interaction.user,
+                            submitted_answer,
+                            result.attempt_count,
+                        )
+                        publication_failed = not published
+                    except Exception as error:  # noqa: BLE001
+                        publication_failed = True
+                        logger.warning(
+                            "Could not publish wrong briddle answer "
+                            "riddle=%d user=%d (%s)",
+                            riddle.id,
+                            user_id,
+                            type(error).__name__,
+                        )
+                elif (
+                    riddle is not None
+                    and riddle.mode == "briddle"
+                    and result.status is SubmissionStatus.CORRECT
+                ):
+                    try:
+                        published = await self._announce_briddle_correct_answer(
+                            riddle,
+                            interaction.user,
+                            len(result.winner_ids),
+                        )
+                        publication_failed = not published
+                    except Exception as error:  # noqa: BLE001
+                        publication_failed = True
+                        logger.warning(
+                            "Could not announce correct briddle answer "
+                            "riddle=%d user=%d (%s)",
+                            riddle.id,
+                            user_id,
+                            type(error).__name__,
+                        )
         finally:
             # 回答本文をインスタンス属性やログへ残さない。
             submitted_answer = ""
@@ -701,19 +891,151 @@ class RiddleCog(commands.Cog):
             return
 
         if result_status == "wrong":
-            await interaction.edit_original_response(content="不正解です。")
+            if riddle.wrong_answer_visibility == "immediate":
+                visibility_notice = (
+                    "\n回答文をスレッドへ公開しました。"
+                    if not publication_failed
+                    else "\n回答は受け付けましたが、スレッドへ公開できませんでした。"
+                )
+            elif riddle.wrong_answer_visibility == "after_close":
+                visibility_notice = "\n回答文は問題終了時に公開されます。"
+            else:
+                visibility_notice = ""
+            await interaction.edit_original_response(
+                content=f"不正解です。{visibility_notice}"
+            )
             return
 
         if result_status == "correct":
-            await interaction.edit_original_response(
-                content="正解です！ 最初の正解者として記録しました。"
+            winner_count = len(result.winner_ids)
+            announcement_notice = (
+                "正解したことをスレッドへ発表しました。"
+                if not publication_failed
+                else "正解は記録しましたが、スレッドへ発表できませんでした。"
             )
-            await self._publish_finalization(riddle.id)
+            if riddle.status == "solved":
+                await interaction.edit_original_response(
+                    content=(
+                        f"正解です！ {winner_count}/{riddle.winner_limit}人に到達し、"
+                        f"回答受付を終了しました。{announcement_notice}"
+                        "問題のスレッドは感想戦に使えます。"
+                    )
+                )
+                await self._publish_finalization(riddle.id)
+            else:
+                remaining_winners = riddle.winner_limit - winner_count
+                await interaction.edit_original_response(
+                    content=(
+                        f"正解です！ 現在{winner_count}/{riddle.winner_limit}人です。"
+                        f"あと{remaining_winners}人の正解で終了します。"
+                        f"{announcement_notice}"
+                    )
+                )
             return
 
         await interaction.edit_original_response(
-            content="この問題には既に正解者がいます。"
+            content="あなたはこの問題に既に正解しています。"
         )
+
+    async def _publish_briddle_wrong_answer(
+        self,
+        riddle: Riddle,
+        user: discord.abc.User,
+        answer: str,
+        attempt_count: int,
+    ) -> bool:
+        if riddle.thread_id is None:
+            return False
+        resolved = await self._resolve_channel(riddle.thread_id)
+        if not isinstance(resolved, discord.Thread):
+            return False
+        if resolved.archived:
+            await resolved.edit(archived=False)
+
+        raw_display_name = (
+            getattr(user, "display_name", None)
+            or getattr(user, "name", None)
+            or "ユーザー"
+        )
+        display_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(raw_display_name)
+        )
+        shown_answer = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(answer)
+        )
+        await resolved.send(
+            f"❌ **{display_name}の不正解（{attempt_count}回目）：** {shown_answer}",
+            allowed_mentions=NO_MENTIONS,
+            suppress_embeds=True,
+        )
+        return True
+
+    async def _announce_briddle_correct_answer(
+        self,
+        riddle: Riddle,
+        user: discord.abc.User,
+        winner_count: int,
+    ) -> bool:
+        if riddle.thread_id is None:
+            return False
+        resolved = await self._resolve_channel(riddle.thread_id)
+        if not isinstance(resolved, discord.Thread):
+            return False
+        if resolved.archived:
+            await resolved.edit(archived=False)
+
+        raw_display_name = (
+            getattr(user, "display_name", None)
+            or getattr(user, "name", None)
+            or "ユーザー"
+        )
+        display_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(raw_display_name)
+        )
+        participant_ids = await self._db(
+            self.database.list_riddle_participant_user_ids,
+            riddle.id,
+        )
+        notification_ids = tuple(dict.fromkeys((riddle.creator_id, *participant_ids)))
+
+        async def send_notification(
+            content: str,
+            user_ids: tuple[int, ...],
+        ) -> None:
+            allowed_mentions = discord.AllowedMentions(
+                everyone=False,
+                users=[discord.Object(id=user_id) for user_id in user_ids],
+                roles=False,
+                replied_user=False,
+            )
+            for attempt in range(2):
+                try:
+                    await resolved.send(
+                        content,
+                        allowed_mentions=allowed_mentions,
+                    )
+                    return
+                except discord.Forbidden:
+                    raise
+                except discord.HTTPException:
+                    if attempt == 1:
+                        raise
+                    # 一時的なDiscord API障害だけを、その場で1回再試行する。
+                    await asyncio.sleep(0.5)
+
+        for offset in range(0, len(notification_ids), BRIDDLE_MENTION_BATCH_SIZE):
+            batch = notification_ids[offset : offset + BRIDDLE_MENTION_BATCH_SIZE]
+            mentions = " ".join(f"<@{user_id}>" for user_id in batch)
+            if offset == 0:
+                content = (
+                    f"🎉 **{display_name}が正解しました！** "
+                    f"（{winner_count}/{riddle.winner_limit}人）\n"
+                    f"関係者通知：{mentions}"
+                )
+            else:
+                content = f"**なぞなぞ #{riddle.id} — 正解通知（続き）**\n{mentions}"
+            await send_notification(content, batch)
+        return True
 
     async def _publish_public_answer(
         self,
@@ -735,7 +1057,9 @@ class RiddleCog(commands.Cog):
             or getattr(user, "name", None)
             or "ユーザー"
         )
-        display_name = discord.utils.escape_markdown(raw_display_name)
+        display_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(raw_display_name)
+        )
         shown_answer = discord.utils.escape_markdown(
             discord.utils.escape_mentions(answer)
         )
@@ -782,14 +1106,26 @@ class RiddleCog(commands.Cog):
 
     @app_commands.command(
         name="briddle",
-        description="最初の正解者が出た時点で答えを発表するなぞなぞを作成します",
+        description="指定人数が正解した時点で答えを発表するなぞなぞを作成します",
     )
     @app_commands.guild_only()
     @app_commands.describe(
         riddle="表示する問題文",
         answer="正解。別解は | で区切れます（他の利用者には表示されません）",
         term="回答期限。30m、2h、1d形式。省略時は24h",
+        winner_limit="何人正解で終了するか。1〜100、省略時は1",
+        wrong_answers="不正解の回答文を公開するタイミング",
+        answer_limit=(
+            "1人あたりの回答回数。1〜100。省略時は終了時公開のみ100、ほかは無制限"
+        ),
         media="問題に添付する画像・音声・動画（1ファイルまで）",
+    )
+    @app_commands.choices(
+        wrong_answers=[
+            app_commands.Choice(name="非公開", value="private"),
+            app_commands.Choice(name="不正解直後に公開", value="immediate"),
+            app_commands.Choice(name="問題終了時に一括公開", value="after_close"),
+        ]
     )
     async def briddle(
         self,
@@ -797,6 +1133,9 @@ class RiddleCog(commands.Cog):
         riddle: str,
         answer: str,
         term: str | None = None,
+        winner_limit: app_commands.Range[int, 1, 100] = 1,
+        wrong_answers: app_commands.Choice[str] | None = None,
+        answer_limit: app_commands.Range[int, 1, 100] | None = None,
         media: discord.Attachment | None = None,
     ) -> None:
         await self._create_riddle(
@@ -807,7 +1146,11 @@ class RiddleCog(commands.Cog):
             term=term,
             media=media,
             public_answers=False,
-            answer_limit=None,
+            answer_limit=answer_limit,
+            winner_limit=winner_limit,
+            wrong_answer_visibility=(
+                "private" if wrong_answers is None else wrong_answers.value
+            ),
         )
 
     @app_commands.command(
@@ -887,6 +1230,8 @@ class RiddleCog(commands.Cog):
         public_answers: bool | None = None,
         answer_limit: int | None = None,
         manual_judging: bool = False,
+        winner_limit: int = 1,
+        wrong_answer_visibility: str = "private",
     ) -> None:
         guild = interaction.guild
         channel = interaction.channel
@@ -953,7 +1298,11 @@ class RiddleCog(commands.Cog):
             )
         else:
             effective_public_answers = False
-            effective_answer_limit = None
+            effective_answer_limit = (
+                100
+                if answer_limit is None and wrong_answer_visibility == "after_close"
+                else answer_limit
+            )
         if manual_judging:
             effective_public_answers = True
 
@@ -998,6 +1347,8 @@ class RiddleCog(commands.Cog):
                 public_answers=effective_public_answers,
                 answer_limit=effective_answer_limit,
                 manual_judging=manual_judging,
+                winner_limit=winner_limit,
+                wrong_answer_visibility=wrong_answer_visibility,
                 answer_accept_emoji=settings.answer_accept_emoji,
                 ogiri_mvp_emoji=settings.ogiri_mvp_emoji,
                 good_question_emoji=settings.good_question_emoji,
@@ -1194,7 +1545,7 @@ class RiddleCog(commands.Cog):
         else:
             heading = "なぞなぞ"
             mode_description = (
-                "最初の正解で発表"
+                f"{riddle.winner_limit}人の正解で発表"
                 if riddle.mode == "briddle"
                 else "期限まで正誤を非公開"
             )
@@ -1211,6 +1562,22 @@ class RiddleCog(commands.Cog):
                 else f"1人{riddle.answer_limit}回"
             )
             settings_lines = f"\n回答文：{visibility}\n回答回数：{limit}"
+        elif riddle.mode == "briddle":
+            wrong_visibility = BRIDDLE_WRONG_ANSWER_VISIBILITY_LABELS[
+                riddle.wrong_answer_visibility
+            ]
+            limit = (
+                "無制限"
+                if riddle.answer_limit is None
+                else f"1人{riddle.answer_limit}回"
+            )
+            settings_lines = (
+                f"\n終了条件：{riddle.winner_limit}人正解"
+                f"\n不正解の回答文：{wrong_visibility}"
+                f"\n回答回数：{limit}"
+                "\n正解者：正解直後に公開"
+                "\n正解通知：出題者と回答経験者をメンション"
+            )
         return (
             f"**{heading} #{riddle.id}**\n"
             f"{riddle.question}\n\n"
@@ -1231,6 +1598,19 @@ class RiddleCog(commands.Cog):
                 f"{riddle.ogiri_mvp_emoji}でMVPにできます。"
                 "Botの🏆が採用またはMVP記録済みの印です。"
             )
+        elif riddle.mode == "briddle":
+            if riddle.wrong_answer_visibility == "immediate":
+                wrong_visibility = "不正解の回答文は、その直後に公開されます。"
+            elif riddle.wrong_answer_visibility == "after_close":
+                wrong_visibility = "不正解の回答文は問題終了時にまとめて公開されます。"
+            else:
+                wrong_visibility = "不正解の回答文は公開されません。"
+            visibility = (
+                f"正解したユーザーは直後に公開されます。{wrong_visibility}"
+                "正解時は出題者と、この問題へ回答したことのある"
+                "ユーザーに通知されます。"
+                f"{riddle.winner_limit}人の正解で回答受付を終了します。"
+            )
         elif riddle.public_answers:
             visibility = (
                 "入力した回答文は回答者名とともにこのスレッドへ公開されます。"
@@ -1247,6 +1627,19 @@ class RiddleCog(commands.Cog):
             else f" 1人{riddle.answer_limit}回まで回答できます。"
         )
         return f"下の「回答する」ボタンから答えを入力してください。{visibility}{limit}"
+
+    def _answer_modal_notice(self, riddle: Riddle) -> str | None:
+        if riddle.mode != "briddle":
+            return None
+        if riddle.wrong_answer_visibility == "immediate":
+            visibility = "不正解の回答文は送信直後にスレッドへ公開されます。"
+        elif riddle.wrong_answer_visibility == "after_close":
+            visibility = "不正解の回答文は問題終了時にスレッドへ公開されます。"
+        else:
+            visibility = "正解した事実だけ公開され、回答文は公開されません。"
+        return (
+            f"{visibility}回答すると、正解が出たときの関係者メンション対象になります。"
+        )
 
     @app_commands.command(
         name="hint",
@@ -2066,6 +2459,7 @@ class RiddleCog(commands.Cog):
                 f"受付中問題への回答回数：{summary.answer_attempts}回\n"
                 f"リアクション判定用の公開回答対応："
                 f"{summary.public_answer_messages}件\n"
+                f"終了時公開待ちの誤答：{summary.deferred_answers}件\n"
                 f"個人設定：{'保存あり' if summary.has_preferences else '初期値'}\n\n"
                 "問題終了時に問題・回答記録は削除されます。"
             )
@@ -2124,6 +2518,8 @@ class RiddleCog(commands.Cog):
                 f"削除した回答回数：{deletion.deleted_answer_attempts}回\n"
                 f"削除した公開回答対応："
                 f"{deletion.deleted_public_answer_messages}件\n"
+                f"削除した終了時公開待ち誤答："
+                f"{deletion.deleted_deferred_answers}件\n"
                 f"削除した個人設定："
                 f"{'あり' if deletion.deleted_preferences else 'なし'}\n"
                 "Discord上であなた自身が投稿したメッセージと、"

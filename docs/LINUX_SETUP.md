@@ -189,7 +189,7 @@ sudo -u discordbot git -C /opt/riddles-discord-bot rev-parse --show-toplevel
 sudo systemctl stop riddles-discord-bot
 sudo -u discordbot cp --no-clobber -p \
   /opt/riddles-discord-bot/data/riddles.db \
-  /opt/riddles-discord-bot/data/riddles.db.before-v3
+  /opt/riddles-discord-bot/data/riddles.db.before-v4
 ```
 
 ローカルの状態と取得予定のコミットを確認してから、fast-forwardだけを許可して更新します。
@@ -211,7 +211,7 @@ sudo systemctl start riddles-discord-bot
 sudo systemctl status riddles-discord-bot --no-pager -l
 ```
 
-新しいBotの初回起動時に、既存のSQLiteデータベースはスキーマバージョン3へ自動移行されます。既存の問題、正解者、回答回数、サーバー設定、個人設定は保持されるため、`data/riddles.db` を削除したり空のDBへ置き換えたりしないでください。
+新しいBotの初回起動時に、既存のSQLiteデータベースはスキーマバージョン4へ自動移行されます。既存の問題、正解者、回答回数、サーバー設定、個人設定は保持され、既存の`/briddle`は1人正解・誤答非公開として継続されます。`data/riddles.db` を削除したり空のDBへ置き換えたりしないでください。
 
 起動後はログとDiscord上の応答を確認します。
 
