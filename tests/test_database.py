@@ -525,6 +525,115 @@ class RiddleDatabaseTests(unittest.TestCase):
         self.assertTrue({"closed_early_at", "finalized_at"} <= columns)
         self.assertEqual(version, 5)
 
+    def test_existing_v5_finalized_rows_are_minimized_idempotently(self) -> None:
+        existing_v5_path = Path(self.temporary_directory.name) / "existing-v5.db"
+        RiddleDatabase(existing_v5_path)
+        with closing(sqlite3.connect(existing_v5_path)) as connection:
+            connection.executescript(
+                """
+                INSERT INTO riddles (
+                    guild_id, channel_id, thread_id, message_id, creator_id,
+                    mode, question, answer_display, answers_json, deadline_at,
+                    status, winner_id, created_at, finalized_at
+                )
+                VALUES (
+                    9, 90, 900, 901, 902, 'riddle', '秘密の問題', '秘密の答え',
+                    '["秘密の答え"]', '2026-07-25T13:00:00.000000Z',
+                    'expired', 903, '2026-07-25T12:00:00.000000Z',
+                    '2026-07-25T13:01:00.000000Z'
+                );
+                INSERT INTO riddles (
+                    guild_id, channel_id, thread_id, message_id, creator_id,
+                    mode, question, answer_display, answers_json, deadline_at,
+                    status, winner_id, created_at
+                )
+                VALUES (
+                    9, 91, 910, 911, 912, 'briddle', '進行中の問題',
+                    '進行中の答え', '["進行中の答え"]',
+                    '2026-07-25T14:00:00.000000Z', 'active', 913,
+                    '2026-07-25T12:00:00.000000Z'
+                );
+                INSERT INTO riddle_winners
+                    (riddle_id, user_id, answered_at)
+                VALUES
+                    (1, 903, '2026-07-25T12:30:00.000000Z'),
+                    (2, 913, '2026-07-25T12:30:00.000000Z');
+                INSERT INTO riddle_attempts
+                    (riddle_id, user_id, attempt_count, last_answered_at)
+                VALUES
+                    (1, 903, 1, '2026-07-25T12:30:00.000000Z'),
+                    (2, 913, 1, '2026-07-25T12:30:00.000000Z');
+                INSERT INTO riddle_answer_messages (
+                    message_id, riddle_id, user_id, attempt_count, posted_at
+                )
+                VALUES
+                    (904, 1, 903, 1, '2026-07-25T12:30:00.000000Z'),
+                    (914, 2, 913, 1, '2026-07-25T12:30:00.000000Z');
+                INSERT INTO riddle_deferred_answers (
+                    riddle_id, user_id, attempt_count, answer_body, submitted_at
+                )
+                VALUES
+                    (1, 903, 1, '秘密の不正解',
+                     '2026-07-25T12:29:00.000000Z'),
+                    (2, 913, 1, '進行中の回答',
+                     '2026-07-25T12:29:00.000000Z');
+                """
+            )
+            connection.commit()
+
+        migrated = RiddleDatabase(existing_v5_path)
+        reopened = RiddleDatabase(existing_v5_path)
+        finalized = reopened.get_riddle(1)
+        active = reopened.get_riddle(2)
+
+        self.assertEqual(finalized.guild_id, 9)
+        self.assertEqual(finalized.channel_id, 90)
+        self.assertEqual(finalized.thread_id, 900)
+        self.assertEqual(finalized.message_id, 901)
+        self.assertEqual(finalized.creator_id, 902)
+        self.assertEqual(finalized.status, "expired")
+        self.assertIsNotNone(finalized.finalized_at)
+        self.assertEqual(finalized.question, "")
+        self.assertEqual(finalized.answer_display, "")
+        self.assertEqual(finalized.normalized_answers, ())
+        self.assertIsNone(finalized.winner_id)
+        self.assertEqual(migrated.get_riddle(1), finalized)
+        self.assertEqual(migrated.list_pending_finalizations(), [])
+        self.assertEqual(
+            migrated.list_finalized_riddles(guild_id=9),
+            [finalized],
+        )
+
+        self.assertEqual(active.question, "進行中の問題")
+        self.assertEqual(active.answer_display, "進行中の答え")
+        self.assertEqual(active.normalized_answers, ("進行中の答え",))
+        self.assertEqual(active.winner_id, 913)
+        with closing(sqlite3.connect(existing_v5_path)) as connection:
+            finalized_child_counts = [
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table_name} WHERE riddle_id = 1"
+                ).fetchone()[0]
+                for table_name in (
+                    "riddle_winners",
+                    "riddle_attempts",
+                    "riddle_answer_messages",
+                    "riddle_deferred_answers",
+                )
+            ]
+            active_child_counts = [
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table_name} WHERE riddle_id = 2"
+                ).fetchone()[0]
+                for table_name in (
+                    "riddle_winners",
+                    "riddle_attempts",
+                    "riddle_answer_messages",
+                    "riddle_deferred_answers",
+                )
+            ]
+        self.assertEqual(finalized_child_counts, [0, 0, 0, 0])
+        self.assertEqual(active_child_counts, [1, 1, 1, 1])
+
     def test_future_schema_version_is_rejected_without_downgrade(self) -> None:
         future_path = Path(self.temporary_directory.name) / "future.db"
         with closing(sqlite3.connect(future_path)) as connection:
@@ -1478,8 +1587,14 @@ class RiddleDatabaseTests(unittest.TestCase):
         self.assertEqual(finalized.message_id, 300)
         self.assertEqual(finalized.status, "solved")
         self.assertEqual(finalized.finalized_at, finalized_at)
+        self.assertEqual(finalized.question, "")
+        self.assertEqual(finalized.answer_display, "")
+        self.assertEqual(finalized.normalized_answers, ())
+        self.assertIsNone(finalized.winner_id)
         self.assertEqual(self.database.get_riddle(riddle.id), finalized)
         self.assertEqual(self.database.list_pending_finalizations(), [])
+        self.assertEqual(self.database.list_finalized_riddles(), [finalized])
+        self.assertEqual(self.database.list_thread_bound_riddles(), [finalized])
         self.assertEqual(self.database.list_winner_ids(riddle.id), ())
         self.assertEqual(
             self.database.get_answer_attempt_count(riddle.id, 501),
@@ -1494,6 +1609,8 @@ class RiddleDatabaseTests(unittest.TestCase):
         reopened = RiddleDatabase(self.database_path)
         self.assertEqual(reopened.get_riddle(riddle.id), finalized)
         self.assertEqual(reopened.list_pending_finalizations(), [])
+        self.assertEqual(reopened.list_finalized_riddles(), [finalized])
+        self.assertEqual(reopened.list_thread_bound_riddles(), [finalized])
         self.assertIsNone(
             reopened.finalize_riddle(
                 riddle.id,

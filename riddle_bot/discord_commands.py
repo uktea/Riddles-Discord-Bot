@@ -239,7 +239,7 @@ class RiddleCog(commands.Cog):
         # スレッドを再オープンする競合を防ぐ。
         self._riddle_operation_lock = asyncio.Lock()
         # /delete による意図的なthread削除を、
-        # on_thread_deleteが途中でDB削除しないよう識別する。
+        # on_raw_thread_deleteが途中でDB削除しないよう識別する。
         self._purging_thread_ids: set[int] = set()
 
     async def _db(self, function: Any, /, *args: Any, **kwargs: Any) -> Any:
@@ -318,6 +318,37 @@ class RiddleCog(commands.Cog):
 
         # 結果発表前に再起動した問題もここで即座に再処理する。
         await self._process_deadlines_once()
+        # Bot停止中にDiscord側で削除されたthreadのイベントは再送されないため、
+        # 起動時にthread紐付けを持つ全問題を照合する。
+        await self._reconcile_thread_bound_riddles()
+
+    async def _reconcile_thread_bound_riddles(self) -> None:
+        for riddle in await self._db(self.database.list_thread_bound_riddles):
+            if riddle.thread_id is None:
+                continue
+            try:
+                resolved = await self._resolve_channel(riddle.thread_id)
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "Could not verify retained thread riddle=%d guild=%d type=%s",
+                    riddle.id,
+                    riddle.guild_id,
+                    type(exc).__name__,
+                )
+                continue
+            thread_exists = isinstance(resolved, discord.Thread)
+            if thread_exists:
+                continue
+
+            async with self._riddle_operation_lock:
+                current = await self._db(self.database.get_riddle, riddle.id)
+                if current is not None and current.thread_id == riddle.thread_id:
+                    await self._db(self.database.delete_riddle, current.id)
+                    logger.info(
+                        "Deleted bound riddle %d because its Discord thread "
+                        "no longer exists",
+                        current.id,
+                    )
 
     @tasks.loop(seconds=15.0, reconnect=True)
     async def deadline_worker(self) -> None:
@@ -387,10 +418,15 @@ class RiddleCog(commands.Cog):
     async def _publish_finalization(self, riddle_id: int) -> None:
         async with self._riddle_operation_lock:
             riddle = await self._db(self.database.get_riddle, riddle_id)
-            if riddle is None or status_value(riddle.status) not in {
-                "solved",
-                "expired",
-            } or riddle.finalized_at is not None:
+            if (
+                riddle is None
+                or status_value(riddle.status)
+                not in {
+                    "solved",
+                    "expired",
+                }
+                or riddle.finalized_at is not None
+            ):
                 return
 
             winner_ids = await self._db(self.database.list_winner_ids, riddle.id)
@@ -545,8 +581,8 @@ class RiddleCog(commands.Cog):
 
             # Discord threadが既に削除されているなら、保持期限も終わっている。
             # それ以外は再発表を防ぐ印だけ付け、問題IDとDiscord紐付けを
-            # /delete または on_thread_delete まで保持する。
-            if riddle.thread_id is not None and thread is None:
+            # /delete または on_raw_thread_delete まで保持する。
+            if thread is None:
                 await self._db(self.database.delete_riddle, riddle.id)
             else:
                 await self._db(self.database.finalize_riddle, riddle.id)
@@ -1829,19 +1865,97 @@ class RiddleCog(commands.Cog):
         return heading + "\n".join(lines) + footer
 
     @app_commands.command(
-        name="delete",
-        description="自分の問題を取り消します。purgeで投稿とスレッドも完全削除できます",
+        name="close",
+        description="自分の問題を締め切り、現在の結果を発表します",
     )
     @app_commands.guild_only()
-    @app_commands.describe(
-        riddle_id="取り消す問題ID",
-        purge="trueなら問題投稿と回答スレッドも削除（元に戻せません）",
+    @app_commands.describe(riddle_id="締め切る問題ID")
+    async def close_riddle(
+        self,
+        interaction: discord.Interaction,
+        riddle_id: int,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None or riddle_id <= 0:
+            await send_ephemeral(interaction, "エラー！：問題IDが不正です。")
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self._riddle_operation_lock:
+            result = await self._db(
+                self.database.close_riddle_early,
+                riddle_id,
+                guild_id=guild.id,
+                actor_id=interaction.user.id,
+                is_admin=is_administrator(interaction),
+            )
+
+        if result.status in {
+            ManualCloseStatus.NOT_FOUND,
+            ManualCloseStatus.WRONG_GUILD,
+        }:
+            await interaction.edit_original_response(
+                content="エラー！：指定された問題が見つかりません。"
+            )
+            return
+        if result.status is ManualCloseStatus.FORBIDDEN:
+            await interaction.edit_original_response(
+                content="エラー！：この問題を締め切れるのは作成者または管理者です。"
+            )
+            return
+        if result.status is ManualCloseStatus.ALREADY_CLOSED:
+            await interaction.edit_original_response(
+                content="エラー！：この問題は既に回答受付を終了しています。"
+            )
+            return
+        if result.riddle is None:
+            await interaction.edit_original_response(
+                content="エラー！：問題の締切状態を確認できませんでした。"
+            )
+            return
+
+        try:
+            await self._publish_finalization(result.riddle.id)
+        except Exception as exc:
+            logger.error(
+                "Will retry publishing manually closed riddle=%d guild=%d "
+                "after type=%s",
+                result.riddle.id,
+                guild.id,
+                type(exc).__name__,
+                exc_info=exc,
+            )
+            await interaction.edit_original_response(
+                content=(
+                    f"問題 #{result.riddle.id} の回答受付は締め切りました。"
+                    "結果の表示に失敗したため、Botが定期処理で再試行します。"
+                )
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=(
+                f"問題 #{result.riddle.id} の回答受付を締め切り、"
+                "結果を発表しました。スレッドは感想戦に使えます。"
+            )
+        )
+        logger.info(
+            "Manually closed riddle id=%d guild=%d by user=%d",
+            result.riddle.id,
+            guild.id,
+            interaction.user.id,
+        )
+
+    @app_commands.command(
+        name="delete",
+        description="自分の問題と回答スレッドを完全削除します",
     )
+    @app_commands.guild_only()
+    @app_commands.describe(riddle_id="完全削除する問題ID（元に戻せません）")
     async def delete(
         self,
         interaction: discord.Interaction,
         riddle_id: int,
-        purge: bool = False,
     ) -> None:
         guild = interaction.guild
         if guild is None or riddle_id <= 0:
@@ -1855,11 +1969,6 @@ class RiddleCog(commands.Cog):
                 content="エラー！：指定された問題が見つかりません。"
             )
             return
-        if riddle.status != "active":
-            await interaction.edit_original_response(
-                content="エラー！：この問題は既に終了しています。"
-            )
-            return
         if riddle.creator_id != interaction.user.id and not is_administrator(
             interaction
         ):
@@ -1868,49 +1977,28 @@ class RiddleCog(commands.Cog):
             )
             return
 
-        expired_riddle_id: int | None = None
         deleted: Riddle | None = None
         try:
             async with self._riddle_operation_lock:
                 current = await self._db(self.database.get_riddle, riddle.id)
-                operation_now = datetime.now(timezone.utc)
                 if (
                     current is not None
                     and current.guild_id == guild.id
-                    and current.status == "active"
-                    and current.deadline_at <= operation_now
-                ):
-                    expired = await self._db(
-                        self.database.mark_riddle_expired,
-                        current.id,
-                        now=operation_now,
+                    and current.thread_id == riddle.thread_id
+                    and current.created_at == riddle.created_at
+                    and (
+                        current.creator_id == interaction.user.id
+                        or is_administrator(interaction)
                     )
-                    if expired is not None:
-                        expired_riddle_id = expired.id
-                elif (
-                    current is not None
-                    and current.guild_id == guild.id
-                    and current.status == "active"
                 ):
-                    if purge:
-                        await self._purge_discord_problem(
-                            current,
-                            actor_id=interaction.user.id,
-                        )
+                    await self._purge_discord_problem(
+                        current,
+                        actor_id=interaction.user.id,
+                    )
                     deleted = await self._db(
-                        self.database.delete_active_riddle,
+                        self.database.delete_riddle,
                         current.id,
-                        now=operation_now,
                     )
-                    if deleted is not None and not purge:
-                        await self._close_discord_problem(
-                            deleted,
-                            heading="取消",
-                            detail=(
-                                f"{interaction.user.display_name}さんが"
-                                "問題を取り消しました。"
-                            ),
-                        )
         except (discord.Forbidden, discord.HTTPException):
             logger.warning(
                 "Could not purge Discord resources riddle=%d guild=%d",
@@ -1927,24 +2015,15 @@ class RiddleCog(commands.Cog):
             )
             return
 
-        if expired_riddle_id is not None:
-            await interaction.edit_original_response(
-                content="エラー！：回答期限を過ぎているため削除できません。"
-            )
-            await self._publish_finalization(expired_riddle_id)
-            return
-
         if deleted is None:
             await interaction.edit_original_response(
-                content="エラー！：この問題は既に終了または削除されています。"
+                content="エラー！：この問題は既に削除されています。"
             )
             return
 
         await interaction.edit_original_response(
             content=(
-                f"問題 #{riddle.id} とDiscord上の投稿・スレッドを完全削除しました。"
-                if purge
-                else f"問題 #{riddle.id} を取り消しました。"
+                f"問題 #{riddle.id} とDiscord上の投稿・回答スレッドを完全削除しました。"
             )
         )
         logger.info(
@@ -1962,29 +2041,40 @@ class RiddleCog(commands.Cog):
     ) -> None:
         """スレッドと起点メッセージを削除する。失敗時は呼び出し側で再試行する。"""
 
+        thread: discord.Thread | None = None
         if riddle.thread_id is not None:
             resolved = await self._resolve_channel(riddle.thread_id)
             if isinstance(resolved, discord.Thread):
-                self._purging_thread_ids.add(resolved.id)
+                thread = resolved
+                self._purging_thread_ids.add(thread.id)
+
+        try:
+            # 起点メッセージの権限不足で失敗した場合にthreadだけを先に消さず、
+            # DBを保持したまま同じ/deleteを安全に再試行できる順序にする。
+            channel = await self._resolve_channel(riddle.channel_id)
+            if (
+                isinstance(channel, discord.TextChannel)
+                and riddle.thread_id is not None
+            ):
                 try:
-                    await resolved.delete(
+                    starter = await channel.fetch_message(riddle.thread_id)
+                    await starter.delete()
+                except discord.NotFound:
+                    pass
+
+            if thread is not None:
+                try:
+                    await thread.delete(
                         reason=(
-                            f"Riddle #{riddle.id} purged by Discord user {actor_id}"
+                            f"Riddle #{riddle.id} deleted by Discord user {actor_id}"
                         )
                     )
                 except discord.NotFound:
-                    self._purging_thread_ids.discard(resolved.id)
-                except discord.HTTPException:
-                    self._purging_thread_ids.discard(resolved.id)
-                    raise
-
-        channel = await self._resolve_channel(riddle.channel_id)
-        if isinstance(channel, discord.TextChannel) and riddle.thread_id is not None:
-            try:
-                starter = await channel.fetch_message(riddle.thread_id)
-                await starter.delete()
-            except discord.NotFound:
-                pass
+                    self._purging_thread_ids.discard(thread.id)
+        except discord.HTTPException:
+            if thread is not None:
+                self._purging_thread_ids.discard(thread.id)
+            raise
 
     async def _close_discord_problem(
         self,
@@ -2461,7 +2551,9 @@ class RiddleCog(commands.Cog):
                 f"{summary.public_answer_messages}件\n"
                 f"終了時公開待ちの誤答：{summary.deferred_answers}件\n"
                 f"個人設定：{'保存あり' if summary.has_preferences else '初期値'}\n\n"
-                "問題終了時に問題・回答記録は削除されます。"
+                "問題終了時に回答記録は削除されます。"
+                "問題IDとDiscordスレッドの紐付けは、"
+                "スレッドが削除されるまで保持されます。"
             )
         )
 
@@ -2498,12 +2590,15 @@ class RiddleCog(commands.Cog):
                 guild.id,
                 interaction.user.id,
             )
+            active_authored = [
+                riddle for riddle in authored if status_value(riddle.status) == "active"
+            ]
             deletion = await self._db(
                 self.database.delete_user_data,
                 guild.id,
                 interaction.user.id,
             )
-            for riddle in authored:
+            for riddle in active_authored:
                 await self._close_discord_problem(
                     riddle,
                     heading="取消",
@@ -2628,14 +2723,19 @@ class RiddleCog(commands.Cog):
             )
 
     @commands.Cog.listener()
-    async def on_thread_delete(self, thread: discord.Thread) -> None:
-        if thread.id in self._purging_thread_ids:
-            self._purging_thread_ids.discard(thread.id)
+    async def on_raw_thread_delete(
+        self,
+        payload: discord.RawThreadDeleteEvent,
+    ) -> None:
+        """キャッシュ有無を問わず、Discord thread削除時に保持データも消す。"""
+
+        if payload.thread_id in self._purging_thread_ids:
+            self._purging_thread_ids.discard(payload.thread_id)
             return
         async with self._riddle_operation_lock:
             riddle = await self._db(
                 self.database.get_riddle_by_thread,
-                thread.id,
+                payload.thread_id,
                 active_only=False,
             )
             if riddle is not None:

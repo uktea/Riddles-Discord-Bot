@@ -2607,6 +2607,55 @@ class DiscordDatabaseIntegrationTests(unittest.IsolatedAsyncioTestCase):
             interaction.edit_original_response.await_args.kwargs["content"],
         )
 
+    async def test_delete_does_not_remove_thread_if_starter_delete_fails(
+        self,
+    ) -> None:
+        riddle = self.create_bound_riddle(mode="riddle", message_id=835)
+        thread = FakePublicThread(thread_id=riddle.thread_id or 0)
+        starter = SimpleNamespace(
+            delete=AsyncMock(
+                side_effect=discord.Forbidden(
+                    SimpleNamespace(status=403, reason="Forbidden"),
+                    "denied",
+                )
+            )
+        )
+        parent = FakeTextChannel(channel_id=riddle.channel_id)
+        parent.fetch_message = AsyncMock(return_value=starter)
+        self.cog._resolve_channel = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda channel_id: (
+                thread if channel_id == riddle.thread_id else parent
+            )
+        )
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            guild_id=1,
+            user=SimpleNamespace(id=100, display_name="作成者"),
+            response=SimpleNamespace(defer=AsyncMock()),
+            edit_original_response=AsyncMock(),
+        )
+
+        with (
+            patch(
+                "riddle_bot.discord_commands.discord.Thread",
+                FakePublicThread,
+            ),
+            patch(
+                "riddle_bot.discord_commands.discord.TextChannel",
+                FakeTextChannel,
+            ),
+        ):
+            await self.cog.delete.callback(
+                self.cog,
+                interaction,  # type: ignore[arg-type]
+                riddle.id,
+            )
+
+        starter.delete.assert_awaited_once()
+        thread.delete.assert_not_awaited()
+        self.assertIsNotNone(self.database.get_riddle(riddle.id))
+        self.assertNotIn(riddle.thread_id, self.cog._purging_thread_ids)
+
     async def test_delete_rechecks_riddle_before_discord_deletion(self) -> None:
         riddle = self.create_bound_riddle(mode="riddle", message_id=840)
         interaction = SimpleNamespace(
@@ -2688,6 +2737,46 @@ class DiscordDatabaseIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(self.database.get_riddle(riddle.id))
         self.assertNotIn(riddle.thread_id, self.cog._purging_thread_ids)
+
+    async def test_startup_reconciliation_removes_missing_bound_threads(self) -> None:
+        missing_active = self.create_bound_riddle(mode="riddle", message_id=864)
+        missing_finished = self.create_bound_riddle(
+            mode="riddle",
+            message_id=865,
+            deadline_at=self.now - timedelta(seconds=1),
+        )
+        existing = self.create_bound_riddle(mode="riddle", message_id=866)
+        self.database.mark_riddle_expired(missing_finished.id, now=self.now)
+        self.database.finalize_riddle(missing_finished.id, now=self.now)
+        existing_thread = FakePublicThread(thread_id=existing.thread_id or 0)
+        self.cog._resolve_channel = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda channel_id: (
+                existing_thread if channel_id == existing.thread_id else None
+            )
+        )
+
+        with patch(
+            "riddle_bot.discord_commands.discord.Thread",
+            FakePublicThread,
+        ):
+            await self.cog._reconcile_thread_bound_riddles()
+
+        self.assertIsNone(self.database.get_riddle(missing_active.id))
+        self.assertIsNone(self.database.get_riddle(missing_finished.id))
+        self.assertIsNotNone(self.database.get_riddle(existing.id))
+
+    async def test_startup_reconciliation_keeps_row_on_discord_error(self) -> None:
+        riddle = self.create_bound_riddle(mode="riddle", message_id=867)
+        self.cog._resolve_channel = AsyncMock(  # type: ignore[method-assign]
+            side_effect=discord.Forbidden(
+                SimpleNamespace(status=403, reason="Forbidden"),
+                "denied",
+            )
+        )
+
+        await self.cog._reconcile_thread_bound_riddles()
+
+        self.assertIsNotNone(self.database.get_riddle(riddle.id))
 
     async def test_deletemydata_does_not_edit_finalized_result_thread(self) -> None:
         riddle = self.create_bound_riddle(

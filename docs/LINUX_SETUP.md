@@ -189,7 +189,7 @@ sudo -u discordbot git -C /opt/riddles-discord-bot rev-parse --show-toplevel
 sudo systemctl stop riddles-discord-bot
 sudo -u discordbot cp --no-clobber -p \
   /opt/riddles-discord-bot/data/riddles.db \
-  /opt/riddles-discord-bot/data/riddles.db.before-v4
+  /opt/riddles-discord-bot/data/riddles.db.before-v5
 ```
 
 ローカルの状態と取得予定のコミットを確認してから、fast-forwardだけを許可して更新します。
@@ -211,7 +211,9 @@ sudo systemctl start riddles-discord-bot
 sudo systemctl status riddles-discord-bot --no-pager -l
 ```
 
-新しいBotの初回起動時に、既存のSQLiteデータベースはスキーマバージョン4へ自動移行されます。既存の問題、正解者、回答回数、サーバー設定、個人設定は保持され、既存の`/briddle`は1人正解・誤答非公開として継続されます。`data/riddles.db` を削除したり空のDBへ置き換えたりしないでください。
+新しいBotの初回起動時に、既存のSQLiteデータベースはスキーマバージョン5へ自動移行されます。既存の問題、正解者、回答回数、サーバー設定、個人設定は保持され、手動締切時刻と結果確定時刻を保存できるようになります。既存の`/briddle`は1人正解・誤答非公開として継続されます。`data/riddles.db` を削除したり空のDBへ置き換えたりしないでください。
+
+結果確定後は問題文・正解・回答履歴を削除し、`/delete riddle_id` に必要な問題IDとDiscord上の投稿・スレッドの紐付けだけを保持します。Discord上で回答スレッドを手動削除した場合は対応する行も削除されます。Bot停止中に削除されたスレッドは、次回起動時の照合で整理されます。
 
 起動後はログとDiscord上の応答を確認します。
 
@@ -225,7 +227,7 @@ sudo journalctl -u riddles-discord-bot -n 100 --no-pager
 
 未終了問題を残したまま切り替えないでください。次の順序で操作します。
 
-1. 旧サーバーで管理者が `/list` を確認し、未終了問題が終わるまで待つか、各問題を `/delete riddle_id` で取り消します。Discord上の問題投稿と回答スレッドも消す場合は、受付中に `/delete riddle_id purge:true` を使用します。
+1. 旧サーバーで管理者が `/list` を確認し、受付中の問題が終わるまで待つか、各問題を `/close riddle_id` で締め切ります。問題投稿と回答スレッドも不要な場合は、受付中・結果確定済みを問わず `/delete riddle_id` で完全削除します。`/delete` に追加パラメータはありません。
 2. Developer Portalの招待URLを使い、同じBotアカウントを必要な権限付きで新サーバーへ招待します。
 3. 旧サーバーからBotを削除します。
 4. systemdサービスを停止します。

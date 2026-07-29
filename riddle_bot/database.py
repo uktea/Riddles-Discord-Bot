@@ -767,7 +767,43 @@ class RiddleDatabase:
                     ADD COLUMN mvp_at TEXT
                     """
                 )
-            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            # v5の初期実装で終了通知済みになった行も、起動時に現行の
+            # 最小保持ポリシーへ揃える。進行中の行には触れず、再実行も安全。
+            connection.executescript(
+                f"""
+                BEGIN IMMEDIATE;
+                UPDATE riddles
+                SET question = '',
+                    answer_display = '',
+                    answers_json = '[]',
+                    winner_id = NULL
+                WHERE finalized_at IS NOT NULL
+                  AND (
+                      question <> ''
+                      OR answer_display <> ''
+                      OR answers_json <> '[]'
+                      OR winner_id IS NOT NULL
+                  );
+                DELETE FROM riddle_answer_messages
+                WHERE riddle_id IN (
+                    SELECT id FROM riddles WHERE finalized_at IS NOT NULL
+                );
+                DELETE FROM riddle_deferred_answers
+                WHERE riddle_id IN (
+                    SELECT id FROM riddles WHERE finalized_at IS NOT NULL
+                );
+                DELETE FROM riddle_attempts
+                WHERE riddle_id IN (
+                    SELECT id FROM riddles WHERE finalized_at IS NOT NULL
+                );
+                DELETE FROM riddle_winners
+                WHERE riddle_id IN (
+                    SELECT id FROM riddles WHERE finalized_at IS NOT NULL
+                );
+                PRAGMA user_version = {CURRENT_SCHEMA_VERSION};
+                COMMIT;
+                """
+            )
 
     def create_riddle(
         self,
@@ -1233,13 +1269,59 @@ class RiddleDatabase:
             ).fetchall()
         return [_riddle_from_row(row) for row in rows]
 
+    def list_finalized_riddles(
+        self,
+        guild_id: int | None = None,
+    ) -> list[Riddle]:
+        """Discord thread削除待ちで保持している結果発表済み問題を返す。"""
+
+        guild_clause = ""
+        parameters: tuple[int, ...] = ()
+        if guild_id is not None:
+            guild_id = _require_positive_integer(guild_id, "guild_id")
+            guild_clause = " AND guild_id = ?"
+            parameters = (guild_id,)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM riddles
+                WHERE finalized_at IS NOT NULL{guild_clause}
+                ORDER BY finalized_at, id
+                """,
+                parameters,
+            ).fetchall()
+        return [_riddle_from_row(row) for row in rows]
+
+    def list_thread_bound_riddles(
+        self,
+        guild_id: int | None = None,
+    ) -> list[Riddle]:
+        """Discord threadとの紐付けを保持している全問題を返す。"""
+
+        guild_clause = ""
+        parameters: tuple[int, ...] = ()
+        if guild_id is not None:
+            guild_id = _require_positive_integer(guild_id, "guild_id")
+            guild_clause = " AND guild_id = ?"
+            parameters = (guild_id,)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM riddles
+                WHERE thread_id IS NOT NULL{guild_clause}
+                ORDER BY id
+                """,
+                parameters,
+            ).fetchall()
+        return [_riddle_from_row(row) for row in rows]
+
     def finalize_riddle(
         self,
         riddle_id: int,
         *,
         now: datetime | None = None,
     ) -> Riddle | None:
-        """結果通知済みにして子データを消し、問題とDiscord紐付けは保持する。
+        """結果通知済みにして本文・回答データを消し、削除用の紐付けは保持する。
 
         solved/expiredかつ未finalizeの問題だけを更新する。同じ問題への再実行や
         active・存在しない問題では ``None`` を返す。
@@ -1263,7 +1345,11 @@ class RiddleDatabase:
             cursor = connection.execute(
                 """
                 UPDATE riddles
-                SET finalized_at = ?
+                SET finalized_at = ?,
+                    question = '',
+                    answer_display = '',
+                    answers_json = '[]',
+                    winner_id = NULL
                 WHERE id = ?
                   AND status IN ('solved', 'expired')
                   AND finalized_at IS NULL
